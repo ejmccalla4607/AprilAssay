@@ -1,8 +1,9 @@
 # AprilAssay
 
-![AprilAssay logo](assets/logo.png)
-
-AprilAssay characterizes camera performance for AprilTag detection in the context of FRC robotics. It runs a live vision pipeline on a Raspberry Pi 4, capturing frames via V4L2, detecting AprilTag 36h11 tags, estimating 6-DOF pose, and logging per-stage latency to measure end-to-end pipeline performance.
+<table><tr>
+<td><img src="assets/logo.png" width="240" alt="AprilAssay logo"></td>
+<td valign="top">AprilAssay characterizes camera performance for AprilTag detection in the context of FRC robotics. It runs a live vision pipeline on a Raspberry Pi 4, capturing frames via V4L2, detecting AprilTag 36h11 tags, estimating 6-DOF pose, and logging per-stage latency to measure end-to-end pipeline performance.</td>
+</tr></table>
 
 ## What it measures
 
@@ -13,10 +14,17 @@ Each pipeline stage is timed independently and averaged over a 2-second reportin
 | Capture | YUYV → grayscale extraction and frame push |
 | Queue | Wait time between capture and detection |
 | Detect | AprilTag detection (`apriltag_detector_detect`) |
-| Pose | 6-DOF pose estimation (`estimate_tag_pose`) |
+| Pose | 6-DOF pose estimation (`cv::solvePnP`) |
 | Total E2E | Camera dequeue to pose complete |
 
-Output is logged to a timestamped file (`vision_YYYYMMDD_HHMMSS.log`) or stdout in debug mode.
+Latency stats are logged every 2 seconds to a timestamped file (`vision_YYYYMMDD_HHMMSS.log`) or stdout in debug mode. Per-frame detection results are logged immediately:
+
+```
+[DETECT] id=5 x=0.123 y=2.341 theta=0.157
+[NO DETECT]
+```
+
+`x` is lateral offset (meters, camera right), `y` is depth (meters, forward), `theta` is yaw of the tag about the vertical axis (radians, zero when facing the camera directly).
 
 ## Hardware
 
@@ -26,6 +34,7 @@ Output is logged to a timestamped file (`vision_YYYYMMDD_HHMMSS.log`) or stdout 
 ## Dependencies
 
 - [AprilTag](https://github.com/AprilRobotics/apriltag)
+- OpenCV 4 (`core`, `calib3d`)
 - CMake ≥ 3.10
 - C++17 compiler
 
