@@ -6,10 +6,12 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native -pthread")
 
 find_package(Eigen3 REQUIRED)
 find_package(apriltag REQUIRED)
+find_package(OpenCV REQUIRED COMPONENTS core calib3d)
+include_directories(${OpenCV_INCLUDE_DIRS})
 
 add_executable(vision src/vision.cpp)
 
-target_link_libraries(vision PRIVATE apriltag::apriltag Eigen3::Eigen)
+target_link_libraries(vision PRIVATE apriltag::apriltag Eigen3::Eigen ${OpenCV_LIBS})
 
 # Build with: cmake -DDEBUG_LOGGING=1 ...
 option(DEBUG_LOGGING "Log to stdout instead of file" OFF)

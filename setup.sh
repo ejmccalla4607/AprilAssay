@@ -3,7 +3,7 @@ set -e
  
 echo "=== Installing dependencies ==="
 sudo apt update
-sudo apt install -y cmake build-essential git libeigen3-dev libjpeg62-turbo-dev v4l-utils
+sudo apt install -y cmake build-essential git libeigen3-dev libjpeg62-turbo-dev v4l-utils libopencv-dev
  
 echo "=== Cloning and building AprilTag ==="
 if [ ! -d ~/apriltag ]; then

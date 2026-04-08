@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstring>
 #include <ctime>
+#include <cmath>
 #include <csignal>
 #include <fcntl.h>
 #include <unistd.h>
@@ -18,10 +19,11 @@
 extern "C" {
 #include "apriltag/apriltag.h"
 #include "apriltag/tag36h11.h"
-#include "apriltag/apriltag_pose.h"
 #include "apriltag/common/image_u8.h"
-#include "apriltag/common/matd.h"
 }
+
+#include <opencv2/core.hpp>
+#include <opencv2/calib3d.hpp>
 
 // Camera intrinsics — calibrate these for your lens
 static const double CAM_FX     = 600.0;
@@ -29,6 +31,14 @@ static const double CAM_FY     = 600.0;
 static const double CAM_CX     = 320.0;
 static const double CAM_CY     = 240.0;
 static const double TAG_SIZE_M = 0.165; // meters (FRC standard tag)
+
+// Distortion coefficients — radial (k1, k2, k3) and tangential (p1, p2)
+// Set to zero until calibrated; uncorrected distortion degrades edge-of-frame accuracy.
+static const double DIST_K1 = 0.0;
+static const double DIST_K2 = 0.0;
+static const double DIST_P1 = 0.0;
+static const double DIST_P2 = 0.0;
+static const double DIST_K3 = 0.0;
 
 static const int CAM_WIDTH  = 640;
 static const int CAM_HEIGHT = 480;
@@ -138,6 +148,7 @@ LatestFrame           latest_frame;
 RingBuffer            log_buffer;
 std::atomic<bool>     running{true};
 std::atomic<uint64_t> camera_frame_count{0};
+std::mutex            log_mtx;
 
 static void handle_signal(int) { running = false; }
 
@@ -180,9 +191,12 @@ void capture_thread() {
 
     // Verify what the driver actually granted
     ioctl(fd, VIDIOC_G_PARM, &parm);
-    *log_out << "Camera frame rate: "
-             << parm.parm.capture.timeperframe.denominator << "/"
-             << parm.parm.capture.timeperframe.numerator   << " fps\n";
+    {
+        std::lock_guard<std::mutex> lock(log_mtx);
+        *log_out << "Camera frame rate: "
+                 << parm.parm.capture.timeperframe.denominator << "/"
+                 << parm.parm.capture.timeperframe.numerator   << " fps\n";
+    }
 
     // Lock camera controls for consistent AprilTag detection
     struct { uint32_t id; int value; const char* name; } cam_ctrls[] = {
@@ -324,31 +338,62 @@ void detection_thread() {
 
         int num = zarray_size(detections);
 
+        // Build camera matrix and distortion coefficients once per thread lifetime
+        static const cv::Mat cam_mat = (cv::Mat_<double>(3, 3)
+            << CAM_FX, 0,      CAM_CX,
+               0,      CAM_FY, CAM_CY,
+               0,      0,      1.0);
+        static const cv::Mat dist_coeffs = (cv::Mat_<double>(5, 1)
+            << DIST_K1, DIST_K2, DIST_P1, DIST_P2, DIST_K3);
+
+        // 3D corners in tag frame: X right, Y up, Z out of tag toward camera.
+        // Ordered to match det->p[0..3]: upper-left, upper-right, lower-right, lower-left.
+        static const std::vector<cv::Point3f> tag_obj_pts = {
+            {-(float)TAG_SIZE_M / 2,  (float)TAG_SIZE_M / 2, 0.f},
+            { (float)TAG_SIZE_M / 2,  (float)TAG_SIZE_M / 2, 0.f},
+            { (float)TAG_SIZE_M / 2, -(float)TAG_SIZE_M / 2, 0.f},
+            {-(float)TAG_SIZE_M / 2, -(float)TAG_SIZE_M / 2, 0.f},
+        };
+
         // --- Pose estimation ---
         for (int i = 0; i < num; i++) {
             apriltag_detection_t* det;
             zarray_get(detections, i, &det);
 
-            apriltag_detection_info_t info;
-            info.det     = det;
-            info.tagsize = TAG_SIZE_M;
-            info.fx      = CAM_FX;
-            info.fy      = CAM_FY;
-            info.cx      = CAM_CX;
-            info.cy      = CAM_CY;
+            std::vector<cv::Point2f> img_pts = {
+                {(float)det->p[0][0], (float)det->p[0][1]},
+                {(float)det->p[1][0], (float)det->p[1][1]},
+                {(float)det->p[2][0], (float)det->p[2][1]},
+                {(float)det->p[3][0], (float)det->p[3][1]},
+            };
 
-            apriltag_pose_t pose;
-            estimate_tag_pose(&info, &pose);
+            cv::Mat rvec, tvec;
+            cv::solvePnP(tag_obj_pts, img_pts, cam_mat, dist_coeffs, rvec, tvec);
 
-            double tx = pose.t->data[0];
-            double ty = pose.t->data[1];
-            double tz = pose.t->data[2];
+            // Extract 2D pose in camera frame:
+            //   x     — lateral offset, camera right = positive (meters)
+            //   y     — depth, forward = positive (meters)
+            //   theta — yaw of tag about vertical axis, zero when tag faces camera directly (radians)
+            cv::Mat R_mat;
+            cv::Rodrigues(rvec, R_mat);
+            double x     = tvec.at<double>(0);
+            double y     = tvec.at<double>(2);
+            double theta = std::atan2(R_mat.at<double>(0, 2), -R_mat.at<double>(2, 2));
 
-            matd_destroy(pose.R);
-            matd_destroy(pose.t);
+            // TODO: publish pose over ethernet
+            {
+                std::lock_guard<std::mutex> lock(log_mtx);
+                *log_out << "[DETECT]"
+                         << " id="    << det->id
+                         << " x="     << x
+                         << " y="     << y
+                         << " theta=" << theta << "\n";
+            }
+        }
 
-            // TODO: publish tx/ty/tz over ethernet
-            (void)tx; (void)ty; (void)tz;
+        if (num == 0) {
+            std::lock_guard<std::mutex> lock(log_mtx);
+            *log_out << "[NO DETECT]\n";
         }
 
         double ts_pose_done = mono_now();
@@ -401,17 +446,20 @@ void logging_thread() {
         double cam_fps    = cam_frames   / interval_s;
         double detect_fps = detect_count / interval_s;
 
-        *log_out << "Cam FPS: " << cam_fps << " | Det FPS: " << detect_fps;
-        if (detect_count > 0) {
-            double n = detect_count;
-            *log_out << " | Capture: "   << capture_sum / n << " ms"
-                     << " | Queue: "     << queue_sum   / n << " ms"
-                     << " | Detect: "    << detect_sum  / n << " ms"
-                     << " | Pose: "      << pose_sum    / n << " ms"
-                     << " | Total E2E: " << total_sum   / n << " ms";
+        {
+            std::lock_guard<std::mutex> lock(log_mtx);
+            *log_out << "Cam FPS: " << cam_fps << " | Det FPS: " << detect_fps;
+            if (detect_count > 0) {
+                double n = detect_count;
+                *log_out << " | Capture: "   << capture_sum / n << " ms"
+                         << " | Queue: "     << queue_sum   / n << " ms"
+                         << " | Detect: "    << detect_sum  / n << " ms"
+                         << " | Pose: "      << pose_sum    / n << " ms"
+                         << " | Total E2E: " << total_sum   / n << " ms";
+            }
+            *log_out << "\n";
+            log_out->flush();
         }
-        *log_out << "\n";
-        log_out->flush();
 
         capture_sum = queue_sum = detect_sum = pose_sum = total_sum = 0;
         detect_count = 0;
