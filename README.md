@@ -1,7 +1,7 @@
 # AprilAssay
 
 <table><tr>
-<td><img src="assets/logo.png" width="320" alt="AprilAssay logo"></td>
+<td><img src="assets/logo.png" width="400" alt="AprilAssay logo"></td>
 <td valign="top">AprilAssay characterizes camera performance for AprilTag detection in the context of FRC robotics. It runs a live vision pipeline on a Raspberry Pi 4, capturing frames via V4L2, detecting AprilTag 36h11 tags, estimating 6-DOF pose, and logging per-stage latency to measure end-to-end pipeline performance.</td>
 </tr></table>
 
