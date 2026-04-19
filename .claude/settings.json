@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(i2cdetect -l)",
+      "Read(//sys/bus/platform/devices/**)",
+      "Read(//boot/firmware/**)",
+      "Bash(dmesg)",
+      "Bash(sudo dtoverlay *)",
+      "Bash(echo \"exit: $?\")",
+      "Read(//dev/**)",
+      "Bash(v4l2-ctl --device=/dev/video0 --all)",
+      "Bash(sudo sed *)",
+      "Bash(sudo bash *)",
+      "Bash(libcamera-still --camera 0 -o /home/ejmccalla/projects/tbd/test.jpg)",
+      "Bash(v4l2-ctl --list-formats-ext --device=/dev/video0)",
+      "Bash(rpicam-still --camera 0 -o /home/ejmccalla/projects/tbd/test.jpg)",
+      "Bash(nm -D /usr/lib/aarch64-linux-gnu/libcamera.so.0.6.0)",
+      "Bash(c++filt)",
+      "Read(//usr/**)",
+      "Read(//usr/share/doc/**)",
+      "Bash(apt-cache show *)",
+      "Bash(apt-cache policy *)",
+      "Bash(nm /usr/lib/aarch64-linux-gnu/libcamera.so.0.6.0)",
+      "Bash(grep -E \"^R8$|^R10_CSI2P$|^NV12$|^YUV420$|^GREY$\")",
+      "Bash(grep -E \"^R8$|^R10$|^GREY$|^Y8$|^YUV\")",
+      "Bash(grep -E \"^R8$|^R10|^GREY|^Y8\")",
+      "Bash(dpkg -l rpicam-apps-core:arm64)",
+      "Bash(dpkg -L rpicam-apps-core)",
+      "Bash(grep \"\\\\.h$\\\\|include\")"
+    ],
+    "additionalDirectories": [
+      "/boot/firmware"
+    ]
+  }
+}

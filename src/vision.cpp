@@ -72,7 +72,9 @@ const SensorSpec* g_sensor      = &SENSORS[0];
 int               g_exposure_us  = 333;
 float             g_gain         = 1.0f;
 int               g_target_fps   = 60;
-const char*       g_snapshot_out = nullptr;
+const char*       g_snapshot_out   = nullptr;
+int               g_nthreads       = 3;
+float             g_quad_decimate  = 1.0f;
 
 LatestFrame           latest_frame;
 std::atomic<bool>     running{true};
@@ -146,8 +148,8 @@ void detection_thread() {
     apriltag_detector_t* td = apriltag_detector_create();
 
     apriltag_detector_add_family(td, tf);
-    td->quad_decimate = 1.0;
-    td->nthreads      = 2;
+    td->quad_decimate = g_quad_decimate;
+    td->nthreads      = g_nthreads;
 
     const SensorSpec& spec = *g_sensor;
 
@@ -289,11 +291,14 @@ void logging_thread() {
 // Main
 // ==========================
 static void print_usage(const char* prog) {
-    std::cerr << "Usage: " << prog << " [--camera ov9281|imx296] [--exposure <µs>] [--gain <x>] [--fps <n>]\n"
-              << "  --camera    Sensor model                  (default: ov9281)\n"
-              << "  --exposure  Exposure time in microseconds (default: 333)\n"
-              << "  --gain      Analogue gain multiplier      (default: 1.0)\n"
-              << "  --fps       Target frame rate             (default: 60)\n";
+    std::cerr << "Usage: " << prog << " [--camera ov9281|imx296] [--exposure <µs>] [--gain <x>] [--fps <n>]"
+                                      " [--nthreads <n>] [--quad-decimate <f>]\n"
+              << "  --camera        Sensor model                  (default: ov9281)\n"
+              << "  --exposure      Exposure time in microseconds (default: 333)\n"
+              << "  --gain          Analogue gain multiplier      (default: 1.0)\n"
+              << "  --fps           Target frame rate             (default: 60)\n"
+              << "  --nthreads      AprilTag detector threads     (default: 2)\n"
+              << "  --quad-decimate AprilTag quad decimation      (default: 1.0)\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -326,6 +331,18 @@ int main(int argc, char* argv[]) {
                 std::cerr << "Error: --fps must be >= 1\n";
                 return 1;
             }
+        } else if (arg == "--nthreads" && i + 1 < argc) {
+            g_nthreads = std::stoi(argv[++i]);
+            if (g_nthreads < 1) {
+                std::cerr << "Error: --nthreads must be >= 1\n";
+                return 1;
+            }
+        } else if (arg == "--quad-decimate" && i + 1 < argc) {
+            g_quad_decimate = std::stof(argv[++i]);
+            if (g_quad_decimate < 1.0f) {
+                std::cerr << "Error: --quad-decimate must be >= 1.0\n";
+                return 1;
+            }
         } else if (arg == "--snapshot" && i + 1 < argc) {
             g_snapshot_out = argv[++i];
         } else {
@@ -335,10 +352,12 @@ int main(int argc, char* argv[]) {
     }
 
     init_logging();
-    *log_out << "Camera: "    << g_sensor->name
-             << " | Exposure: " << g_exposure_us << " µs"
-             << " | Gain: "     << g_gain << "x"
-             << " | Target FPS: " << g_target_fps << "\n";
+    *log_out << "Camera: "         << g_sensor->name
+             << " | Exposure: "   << g_exposure_us << " µs"
+             << " | Gain: "       << g_gain << "x"
+             << " | Target FPS: " << g_target_fps
+             << " | nthreads: "   << g_nthreads
+             << " | quad_decimate: " << g_quad_decimate << "\n";
 
     signal(SIGINT,  handle_signal);
     signal(SIGTERM, handle_signal);
