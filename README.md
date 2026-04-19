@@ -2,7 +2,7 @@
 
 <table><tr>
 <td><img src="assets/logo.png" width="400" alt="AprilAssay logo"></td>
-<td valign="top">AprilAssay characterizes camera performance for AprilTag detection in the context of FRC robotics. It runs a live vision pipeline on a Raspberry Pi 4, capturing frames via V4L2, detecting AprilTag 36h11 tags, estimating 6-DOF pose, and logging per-stage latency to measure end-to-end pipeline performance.</td>
+<td valign="top">AprilAssay characterizes camera performance for AprilTag detection in the context of FRC robotics. It runs a live vision pipeline on a Raspberry Pi 4, capturing frames directly via V4L2/unicam, detecting AprilTag 36h11 tags, estimating 6-DOF pose, and logging per-stage latency to measure end-to-end pipeline performance.</td>
 </tr></table>
 
 ## What it measures
@@ -11,17 +11,16 @@ Each pipeline stage is timed independently and averaged over a 2-second reportin
 
 | Stage | Description |
 |---|---|
-| Capture | YUYV → grayscale extraction and frame push |
+| Capture | Unpack from DMA staging buffer to 8-bit gray |
 | Queue | Wait time between capture and detection |
 | Detect | AprilTag detection (`apriltag_detector_detect`) |
 | Pose | 6-DOF pose estimation (`cv::solvePnP`) |
-| Total E2E | Camera dequeue to pose complete |
+| Total E2E | Dequeue time to pose complete |
 
 Latency stats are logged every 2 seconds to a timestamped file (`vision_YYYYMMDD_HHMMSS.log`) or stdout in debug mode. Per-frame detection results are logged immediately:
 
 ```
 [DETECT] id=5 x=0.123 y=2.341 theta=0.157
-[NO DETECT]
 ```
 
 `x` is lateral offset (meters, camera right), `y` is depth (meters, forward), `theta` is yaw of the tag about the vertical axis (radians, zero when facing the camera directly).
@@ -29,14 +28,19 @@ Latency stats are logged every 2 seconds to a timestamped file (`vision_YYYYMMDD
 ## Hardware
 
 - Raspberry Pi 4
-- USB camera with V4L2 support (tested at 640×480 YUYV 30fps)
+- One of the following on CSI-2:
+  - **OV9281** — global shutter monochrome, 1280×800, 10-bit
+  - **IMX296** — global shutter monochrome, 1456×1088, 10-bit
+
+Both sensors output raw 10-bit CSI-2 packed data (`Y10P`). Frames bypass the ISP entirely — no tone mapping, no noise reduction, no compression.
 
 ## Dependencies
 
 - [AprilTag](https://github.com/AprilRobotics/apriltag)
-- OpenCV 4 (`core`, `calib3d`)
+- OpenCV 4 (`core`, `calib3d`, `imgcodecs`)
 - CMake ≥ 3.10
 - C++17 compiler
+- Linux kernel V4L2 headers (standard on Raspberry Pi OS)
 
 Run the setup script once to install dependencies and build from scratch:
 
@@ -59,60 +63,106 @@ After initial setup, use the rebuild script for subsequent builds:
 ## Running
 
 ```bash
-./build/vision
+./build/vision [--camera ov9281|imx296] [--exposure <µs>] [--gain <x>] [--fps <n>] [--snapshot <file>]
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--camera` | `ov9281` | Sensor model — selects resolution, intrinsics, and timing parameters |
+| `--exposure` | 333 µs | Exposure time in microseconds |
+| `--gain` | 1.0× | Analogue gain multiplier |
+| `--fps` | 60 | Target frame rate; clamped to sensor maximum |
+| `--snapshot` | — | Capture one frame, save as PNG, and exit |
+
+Examples:
+```bash
+./build/vision                                         # OV9281, defaults
+./build/vision --camera imx296                         # IMX296, defaults
+./build/vision --camera ov9281 --exposure 1000         # OV9281, 1 ms exposure
+./build/vision --exposure 500 --gain 2                 # OV9281, 500 µs, 2x gain
+./build/vision --fps 100                               # push toward sensor max (~116 fps)
+./build/vision --snapshot frame.png                    # save a single frame and exit
 ```
 
 Stop with `Ctrl-C`.
 
 ## Configuration
 
-Camera intrinsics and tag size are defined as constants at the top of [src/vision.cpp](src/vision.cpp):
+Per-sensor parameters are defined in the `SENSORS[]` table at the top of [src/vision.cpp](src/vision.cpp). Each entry holds the sensor's resolution, black level, camera intrinsics, and V4L2 timing parameters:
 
 ```cpp
-static const double CAM_FX     = 600.0;   // focal length x (pixels)
-static const double CAM_FY     = 600.0;   // focal length y (pixels)
-static const double CAM_CX     = 320.0;   // principal point x
-static const double CAM_CY     = 240.0;   // principal point y
-static const double TAG_SIZE_M = 0.165;   // tag size in meters (FRC standard)
+const SensorSpec SENSORS[2] = {
+    {
+        "OV9281",
+        1280, 800,
+        64,     // 10-bit black level
+        600.0, 600.0, 640.0, 400.0,   // fx, fy, cx, cy — calibrate per lens
+        0.0, 0.0, 0.0, 0.0, 0.0,      // k1, k2, p1, p2, k3
+        11,             // vblank_min
+        424,            // hblank_min  (hts = 1704)
+        160'000'000LL,  // pixel_clock_hz
+        16.0f, 16, 248, // gain_reg_per_unit, min, max
+    },
+    ...
+};
 ```
+
+Tag size is a separate constant (it's a property of the field, not the camera):
+
+```cpp
+static const double TAG_SIZE_M = 0.165;  // FRC standard tag, meters
+```
+
+## Pixel format
+
+Both sensors are native 10-bit monochrome. Frames are captured as `Y10P` — CSI-2 packed 10-bit, 4 pixels per 5 bytes:
+
+```
+byte 0: pixel 0 [9:2]
+byte 1: pixel 1 [9:2]
+byte 2: pixel 2 [9:2]
+byte 3: pixel 3 [9:2]
+byte 4: [p3[1:0] | p2[1:0] | p1[1:0] | p0[1:0]]
+```
+
+`unpack_to_u8()` in [src/camera.h](src/camera.h) converts this to 8-bit for the AprilTag detector: the 10-bit sample is unpacked, the sensor black level is subtracted, the result is clamped to `[0, 1023 - black_level]`, then scaled to `[0, 255]`.
+
+The DMA buffer is first copied to a heap-allocated staging buffer before unpacking. V4L2 DMA mappings on ARM are typically uncached; reading them byte-by-byte in the unpack loop would be very slow.
 
 ## Camera sensor parameters
 
-Set via V4L2 controls in `capture_thread()` in [src/vision.cpp](src/vision.cpp):
+Set via V4L2 subdev controls in `capture_thread()` in [src/capture_v4l2.cpp](src/capture_v4l2.cpp):
 
-| Parameter | Current value | Effect |
+| Parameter | Control | Effect |
 |---|---|---|
-| Resolution | 640×480 | Higher resolution extends detection range but increases capture and detection time. Must match `CAM_WIDTH`/`CAM_HEIGHT` constants. |
-| Frame rate | 30 fps | Higher frame rates reduce queue latency but require shorter exposure times, which increases noise. |
-| Exposure mode | Manual | Locks exposure so lighting changes don't alter detection reliability between runs. |
-| Exposure time | 333 (33.3 ms) | In units of 100 µs. Shorter exposure reduces motion blur on fast-moving robots; too short increases noise and darkens the image. |
-| Gain | not set | Amplifies the sensor signal. Higher gain brightens dark scenes but increases noise, which hurts quad detection. |
-| Brightness | not set | Offset applied to pixel values. Can compensate for underexposed images, but gain and exposure are preferred. |
-| Backlight compensation | 0 (disabled) | Prevents the camera from brightening the image to compensate for bright backgrounds, which can wash out tags. |
-| Sharpness | 15 | In-camera edge enhancement. Moderate sharpness helps quad edge detection; too high introduces ringing artifacts. |
-| Auto white balance | 0 (disabled) | Locks color processing so the grayscale conversion is consistent across lighting conditions. |
+| Frame rate | `V4L2_CID_VBLANK` | Computed from `--fps` and pixel clock. Higher rates reduce queue latency but require shorter exposure to avoid sensor-extended frame times. |
+| Horizontal blanking | `V4L2_CID_HBLANK` | Set to `hblank_min` from the sensor table. Determines horizontal total (`hts = width + hblank`), which feeds the fps calculation. |
+| Exposure | `V4L2_CID_EXPOSURE` | In sensor lines. Converted from `--exposure` µs using `line_period = hts / pixel_clock`. Shorter exposure reduces motion blur; too short darkens the image and hurts quad detection. |
+| Analogue gain | `V4L2_CID_ANALOGUE_GAIN` | Register value = `gain × gain_reg_per_unit`, clamped to `[gain_reg_min, gain_reg_max]`. Higher gain brightens dark scenes but increases noise. |
+
+Both sensors are monochrome — AWB is not applicable.
 
 ## Camera intrinsic parameters
 
 | Parameter | Description | Characterization notes |
 |---|---|---|
-| `CAM_FX` / `CAM_FY` | Focal length in pixels (x and y). Derived from physical focal length and pixel size. | Errors scale all translation estimates. Must be calibrated per lens — do not assume equal for non-square pixels. |
-| `CAM_CX` / `CAM_CY` | Principal point: pixel coordinates of the optical axis. Ideally image center, but rarely exactly so. | Errors cause systematic pose bias that worsens off-axis. Calibrate rather than assume `width/2`, `height/2`. |
+| `fx` / `fy` | Focal length in pixels (x and y). Derived from physical focal length and pixel size. | Errors scale all translation estimates. Must be calibrated per lens — do not assume equal for non-square pixels. |
+| `cx` / `cy` | Principal point: pixel coordinates of the optical axis. Ideally image center, but rarely exactly so. | Errors cause systematic pose bias that worsens off-axis. Calibrate rather than assume `width/2`, `height/2`. |
 | `TAG_SIZE_M` | Physical side length of the tag in meters. FRC standard is 0.165 m. | Directly scales the translation vector. A 1% size error produces a 1% range error. Measure the printed tag, not the spec. |
-| Distortion coefficients | Radial (`k1`, `k2`, `k3`) and tangential (`p1`, `p2`) lens distortion. Not currently modeled. | Uncorrected distortion degrades pose accuracy at the edges of the frame. Most impactful with wide-angle lenses. |
+| Distortion coefficients | Radial (`k1`, `k2`, `k3`) and tangential (`p1`, `p2`) lens distortion. Currently zero. | Uncorrected distortion degrades pose accuracy at the edges of the frame. Most impactful with wide-angle lenses. |
 
 ## AprilTag detector parameters
 
 Set in `detection_thread()` in [src/vision.cpp](src/vision.cpp):
 
 ```cpp
-td->quad_decimate = 2.0;
+td->quad_decimate = 1.0;
 td->nthreads      = 2;
 ```
 
 | Parameter | Value | Effect |
 |---|---|---|
-| `quad_decimate` | 2.0 | Downsamples the image by this factor before quad detection. Higher values are faster but reduce detection range and accuracy on small or distant tags. 1.0 disables decimation. |
+| `quad_decimate` | 1.0 | Downsamples the image by this factor before quad detection. Higher values are faster but reduce detection range and accuracy on small or distant tags. 1.0 disables decimation. |
 | `nthreads` | 2 | Number of threads the detector uses internally. Tune to match available cores without starving the capture thread. |
 
 Other detector fields worth studying for characterization:
