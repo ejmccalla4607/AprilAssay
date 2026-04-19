@@ -115,6 +115,8 @@ struct LogSample {
     double detect_ms;
     double pose_ms;
     double total_ms;
+    int detections_count;
+    int frames_with_detections;
 };
 
 constexpr int LOG_SIZE = 1024;
@@ -216,7 +218,8 @@ void detection_thread() {
                          << " id="    << det->id
                          << " x="     << x
                          << " y="     << y
-                         << " theta=" << theta << "\n";
+                         << " theta=" << theta
+                         << " margin=" << det->decision_margin << "\n";
             }
         }
 
@@ -229,6 +232,8 @@ void detection_thread() {
             (ts_detect_done   - f.ts_dequeued)  * 1000.0,
             (ts_pose_done     - ts_detect_done) * 1000.0,
             (ts_pose_done     - f.ts_camera)    * 1000.0,
+            num,
+            num > 0 ? 1 : 0
         });
     }
 
@@ -243,7 +248,9 @@ void logging_thread() {
     LogSample s;
     double   capture_sum = 0, queue_sum = 0, detect_sum = 0,
              pose_sum    = 0, total_sum  = 0;
-    int      detect_count    = 0;
+    int      detections_sum = 0;
+    int      frames_with_detections_sum = 0;
+    int      processed_frames_sum = 0;
     uint64_t last_camera_count = 0;
 
     const double interval_s = LOG_INTERVAL_MS / 1000.0;
@@ -257,7 +264,9 @@ void logging_thread() {
             detect_sum  += s.detect_ms;
             pose_sum    += s.pose_ms;
             total_sum   += s.total_ms;
-            detect_count++;
+            detections_sum += s.detections_count;
+            frames_with_detections_sum += s.frames_with_detections;
+            ++processed_frames_sum;
         }
 
         uint64_t current_camera_count = camera_frame_count.load(std::memory_order_relaxed);
@@ -265,13 +274,14 @@ void logging_thread() {
         last_camera_count             = current_camera_count;
 
         double cam_fps    = cam_frames   / interval_s;
-        double detect_fps = detect_count / interval_s;
+        double det_fps    = processed_frames_sum / interval_s;
+        double detection_rate = processed_frames_sum > 0 ? (double)frames_with_detections_sum / processed_frames_sum : 0.0;
 
         {
             std::lock_guard<std::mutex> lock(log_mtx);
-            *log_out << "Cam FPS: " << cam_fps << " | Det FPS: " << detect_fps;
-            if (detect_count > 0) {
-                double n = detect_count;
+            *log_out << "Cam FPS: " << cam_fps << " | Det FPS: " << det_fps << " | Det Rate: " << detection_rate;
+            if (detections_sum > 0) {
+                double n = detections_sum;
                 *log_out << " | Capture: "   << capture_sum / n << " ms"
                          << " | Queue: "     << queue_sum   / n << " ms"
                          << " | Detect: "    << detect_sum  / n << " ms"
@@ -283,7 +293,9 @@ void logging_thread() {
         }
 
         capture_sum = queue_sum = detect_sum = pose_sum = total_sum = 0;
-        detect_count = 0;
+        detections_sum = 0;
+        frames_with_detections_sum = 0;
+        processed_frames_sum = 0;
     }
 }
 
@@ -292,13 +304,14 @@ void logging_thread() {
 // ==========================
 static void print_usage(const char* prog) {
     std::cerr << "Usage: " << prog << " [--camera ov9281|imx296] [--exposure <µs>] [--gain <x>] [--fps <n>]"
-                                      " [--nthreads <n>] [--quad-decimate <f>]\n"
+                                      " [--nthreads <n>] [--quad-decimate <f>] [--snapshot <file>]\n"
               << "  --camera        Sensor model                  (default: ov9281)\n"
               << "  --exposure      Exposure time in microseconds (default: 333)\n"
               << "  --gain          Analogue gain multiplier      (default: 1.0)\n"
               << "  --fps           Target frame rate             (default: 60)\n"
               << "  --nthreads      AprilTag detector threads     (default: 2)\n"
-              << "  --quad-decimate AprilTag quad decimation      (default: 1.0)\n";
+              << "  --quad-decimate AprilTag quad decimation      (default: 1.0)\n"
+              << "  --snapshot      Capture one frame, save as PNG, and exit\n";
 }
 
 int main(int argc, char* argv[]) {

@@ -20,10 +20,10 @@ Each pipeline stage is timed independently and averaged over a 2-second reportin
 Latency stats are logged every 2 seconds to a timestamped file (`vision_YYYYMMDD_HHMMSS.log`) or stdout in debug mode. Per-frame detection results are logged immediately:
 
 ```
-[DETECT] id=5 x=0.123 y=2.341 theta=0.157
+[DETECT] id=5 x=0.123 y=2.341 theta=0.157 margin=0.85
 ```
 
-`x` is lateral offset (meters, camera right), `y` is depth (meters, forward), `theta` is yaw of the tag about the vertical axis (radians, zero when facing the camera directly).
+`x` is lateral offset (meters, camera right), `y` is depth (meters, forward), `theta` is yaw of the tag about the vertical axis (radians, zero when facing the camera directly), `margin` is the decision margin (0–1, higher is more confident).
 
 ## Hardware
 
