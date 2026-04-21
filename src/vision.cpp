@@ -45,23 +45,24 @@ const SensorSpec SENSORS[2] = {
         16.0f,           // gain_reg_per_unit: reg=16 → 1.0x
         16,              // gain_reg_min (1.0x)
         248,             // gain_reg_max (15.5x)
+        false,           // linear gain
     },
     {
-        // imx296 driver: hts≈1960, pixel_rate≈148.5 MHz
-        // fps_max = 148.5e6 / (1960 * (1088 + vblank_min)) ≈ 68 fps at vblank_min=22
-        // NOTE: IMX296 gain is 0.1 dB steps (0–239); gain_reg_per_unit is a linear
-        // approximation only — replace with a dB conversion for accurate gain control.
+        // imx296: hblank=304 (read-only), pixel_rate=118.8 MHz (from v4l2-ctl)
+        // fps_max = 118.8e6 / (1760 * (1088 + vblank_min)) ≈ 60 fps at vblank_min=30
+        // Gain: 0.1 dB steps (reg = round(200 * log10(gain))); max reg=480 per driver.
         "IMX296",
         1456, 1088,
         60,     // 10-bit black level (3840 >> 6)
         900.0, 900.0, 728.0, 544.0,
         0.0, 0.0, 0.0, 0.0, 0.0,
-        22,              // vblank_min
-        504,             // hblank_min  (hts = 1960)
-        148'500'000LL,   // pixel_clock_hz
-        16.0f,           // gain_reg_per_unit (placeholder — see NOTE above)
+        30,              // vblank_min (from v4l2-ctl min=30)
+        304,             // hblank_min (from v4l2-ctl, read-only)
+        118'800'000LL,   // pixel_clock_hz (from v4l2-ctl value=118800000)
+        0.0f,            // gain_reg_per_unit (unused — log_gain=true)
         0,               // gain_reg_min (0 dB = 1.0x)
-        239,             // gain_reg_max (~24 dB)
+        480,             // gain_reg_max (from v4l2-ctl max=480)
+        true,            // logarithmic: reg = round(200 * log10(gain))
     },
 };
 

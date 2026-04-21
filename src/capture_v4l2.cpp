@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <unistd.h>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <string>
@@ -159,8 +160,9 @@ void capture_thread() {
     int exposure_lines = std::max(1, (int)(g_exposure_us / line_period_us));
     set_ctrl(subdev_fd, V4L2_CID_EXPOSURE, exposure_lines, "EXPOSURE");
 
-    int gain_reg = std::clamp((int)(g_gain * spec.gain_reg_per_unit),
-                              spec.gain_reg_min, spec.gain_reg_max);
+    int gain_reg = spec.log_gain
+        ? std::clamp((int)std::round(200.0f * std::log10(g_gain)), spec.gain_reg_min, spec.gain_reg_max)
+        : std::clamp((int)(g_gain * spec.gain_reg_per_unit),        spec.gain_reg_min, spec.gain_reg_max);
     set_ctrl(subdev_fd, V4L2_CID_ANALOGUE_GAIN, gain_reg, "ANALOGUE_GAIN");
 
     {
@@ -224,7 +226,7 @@ void capture_thread() {
     const int pixels = spec.width * spec.height;
 
     // Heap staging buffer — avoids byte-by-byte reads from uncached DMA memory.
-    std::vector<uint8_t> raw_staging(frame_size);
+    std::vector<uint8_t> raw_staging(frame_size + 32);  // +32 for NEON overread safety
 
     // ---- Capture loop ----------------------------------------------------
     while (running) {
