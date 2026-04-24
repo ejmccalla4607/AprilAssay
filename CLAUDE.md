@@ -4,7 +4,27 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this project is
 
-AprilAssay is a latency-characterization pipeline for AprilTag detection in FRC robotics. It runs on a Raspberry Pi 4 with an OV9281 or IMX296 global-shutter CSI-2 camera, captures raw 10-bit frames via V4L2/unicam (bypassing the ISP entirely), detects AprilTag 36h11 tags, estimates 6-DOF pose, and logs per-stage latency. The primary goal is minimizing and measuring end-to-end latency from center-of-exposure to pose output.
+AprilAssay characterizes camera sensor performance for FRC AprilTag detection. It has two interlocking goals:
+
+1. **Latency pipeline** (current code): runs on a Raspberry Pi 4 with an OV9281 or IMX296 global-shutter CSI-2 camera, captures raw 10-bit frames via V4L2/unicam (bypassing the ISP entirely), detects AprilTag 36h11 tags, estimates 6-DOF pose, and logs per-stage latency. The primary goal is minimizing and measuring end-to-end latency from center-of-exposure to pose output.
+
+2. **Sensor characterization** (planned, not yet implemented): a systematic sweep that quantifies how detection reliability degrades under the lighting failure modes documented at real FRC competitions — uneven venue spotlights (GCR 2025), sun glare through windows (Gotham 2025), robot-body shadowing (Team 6328 2025), and near-darkness venues (PCH District Championship 2023). The characterization compares OV9281 vs IMX296 across the full (exposure × gain) space under controlled illumination, shadow, and specular glare conditions, producing the first published quantitative data on which sensor holds up better and why. See `docs/AptilTag Sensor Characterization Plan.docx` for the full protocol.
+
+## Characterization plan summary
+
+The characterization targets three test cases (see `docs/` for full detail):
+
+**Test Case 1 — Full sweep (primary)**: 54 manual fixture positions (3X × 3Y × 3Z × 2 illumination levels: ~500 lux "Well-Lit" and ~50 lux "Poorly-Lit"). At each position, automated inner loop over 40 (gain × exposure) combinations — gain at 0/6/12/18/24 dB, exposure at 25/50/100/200/400/800/1600/3200 µs (log-spaced). 300 frames per point. Output: detection rate, mean/std decision_margin, white/black patch DN, saturation flag.
+
+**Test Case 2 — Shadow sweep**: tag partially or fully occluded (25/50/75/100% coverage) at shadow depths of 2:1, 5:1, 10:1 lux ratio. Camera exposed for the lit scene and locked; measures at what occlusion/depth combination each sensor loses the tag.
+
+**Test Case 3 — Specular glare**: tag on standard AndyMark polycarbonate panel, focused COB light creates hotspot. Glare intensity swept to 25/50/75/100% of 8-bit saturation. Tests whether IMX296's larger full-well tolerates more glare before forcing a conservative exposure that darkens the rest of the tag below the detection floor.
+
+**Why IMX296 is expected to win**: 10 dB more dynamic range (~70 dB vs ~60 dB), lower read noise (~2–3e vs ~4–7e), larger full well (~10,000e vs ~6,000–7,000e). At high gain (18–24 dB), read noise is amplified — OV9281's higher noise floor produces 2–3× more noise contamination than IMX296 at the same gain setting, narrowing the detection window faster from both ends.
+
+**Platform note**: the characterization plan was written for Pi 5 + libcamera. The current codebase runs Pi 4 + V4L2/unicam with Y10P packed format. The characterization sweep software has not been written yet. When implementing it, use the existing V4L2 capture backend — do not add a libcamera dependency. The raw pipeline differences (Pi 5 PiSP 16-bit left-shifted vs Pi 4 Y10P packed) are already handled by the existing `unpack_to_u8` NEON path in `camera.h`.
+
+**Key metric for FRC teams**: detection window width (range of exposures with >95% detection rate) at each gain level. A wider window means the sensor tolerates more venue-to-venue illumination variation without retuning. The characterization also validates a field workflow: measure lux at each tag with a $30 meter during calibration hour, look up the matching pre-characterized exposure/gain profile, load it — no subjective trial-and-error.
 
 ## Build and run
 
@@ -131,4 +151,12 @@ Use `v4l2-ctl --list-ctrls` on target hardware to verify:
 
 ## Camera calibration
 
-Intrinsics in `SENSORS[]` are placeholders. Calibrate with a checkerboard using `cv::calibrateCamera` and update `fx, fy, cx, cy, dist_k1..k3, dist_p1, dist_p2` per lens. `TAG_SIZE_M` (0.165 m) is the FRC standard tag side length — measure the physical printed tag, not the spec.
+Intrinsics in `SENSORS[]` are placeholders. The full calibration procedure is in Appendix B of `docs/AptilTag Sensor Characterization Plan.docx`. Summary:
+
+- Use a ChArUco board (6×8, 30mm squares, DICT_4X4_50) — not a plain checkerboard. ChArUco works with partial board views, important for wide-angle lenses.
+- Focus at 8–10 ft on a high-contrast target before calibrating. Do not focus at desk range.
+- Collect 30–50 images with varied distance, tilt, and frame position. Frontal-only images produce poor principal-point estimates.
+- Use `cv::aruco::calibrateCameraCharuco`. Target RMS reprojection error < 0.5 px; > 1.0 px means recollect.
+- Update `fx, fy, cx, cy, dist_k1..k3, dist_p1, dist_p2` in `SENSORS[]` per lens configuration. Each lens + focus position requires its own calibration — do not reuse across configurations.
+- `TAG_SIZE_M` (0.165 m) is the FRC standard tag side length — measure the physical printed tag, not the spec. A 1% size error produces a 1% range error.
+- Wide-angle OV9281 configs (2.1mm, ~82° HFOV) have significant barrel distortion; calibration is especially critical and distortion coefficients will be non-trivial.
