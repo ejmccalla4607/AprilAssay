@@ -2,11 +2,33 @@
 
 #include <vector>
 #include <mutex>
+#include <condition_variable>
+#include <memory>
 #include <atomic>
 #include <cstdint>
 #include <ostream>
 #include <ctime>
 #include <algorithm>
+#include <pthread.h>
+
+// Priority-inheriting mutex — prevents priority inversion between RT and non-RT threads.
+// Satisfies BasicLockable so std::lock_guard/std::unique_lock work normally.
+class PIMutex {
+    pthread_mutex_t m_;
+public:
+    PIMutex() {
+        pthread_mutexattr_t attr;
+        pthread_mutexattr_init(&attr);
+        pthread_mutexattr_setprotocol(&attr, PTHREAD_PRIO_INHERIT);
+        pthread_mutex_init(&m_, &attr);
+        pthread_mutexattr_destroy(&attr);
+    }
+    ~PIMutex()  { pthread_mutex_destroy(&m_); }
+    void lock()   { pthread_mutex_lock(&m_); }
+    void unlock() { pthread_mutex_unlock(&m_); }
+    PIMutex(const PIMutex&)            = delete;
+    PIMutex& operator=(const PIMutex&) = delete;
+};
 
 // ==========================
 // Sensor Specifications
@@ -49,18 +71,25 @@ struct Frame {
 };
 
 class LatestFrame {
-    std::mutex mtx;
-    Frame    frame;
+    PIMutex                     mtx;
+    std::condition_variable_any cv;
+    std::shared_ptr<Frame>      frame;
     uint64_t push_id = 0;
     uint64_t get_id  = 0;
 public:
-    void push(Frame&& f) {
-        std::lock_guard<std::mutex> lock(mtx);
-        frame = std::move(f);
-        push_id++;
+    void push(std::shared_ptr<Frame> f) {
+        {
+            std::lock_guard<PIMutex> lock(mtx);
+            frame = std::move(f);
+            push_id++;
+        }
+        cv.notify_one();
     }
-    bool get(Frame& out) {
-        std::lock_guard<std::mutex> lock(mtx);
+    // Blocks until a new frame is available; returns false on 50 ms timeout (for shutdown polling).
+    bool wait_and_get(std::shared_ptr<Frame>& out) {
+        std::unique_lock<PIMutex> lock(mtx);
+        cv.wait_for(lock, std::chrono::milliseconds(50),
+                    [&]{ return get_id != push_id; });
         if (get_id == push_id) return false;
         out    = frame;
         get_id = push_id;
@@ -74,7 +103,7 @@ public:
 extern LatestFrame           latest_frame;
 extern std::atomic<bool>     running;
 extern std::atomic<uint64_t> camera_frame_count;
-extern std::mutex            log_mtx;
+extern PIMutex               log_mtx;
 extern std::ostream*         log_out;
 
 inline double mono_now() {

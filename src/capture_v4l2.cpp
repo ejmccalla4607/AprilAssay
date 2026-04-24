@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <thread>
 
 // Scan /sys/class/video4linux/<devname>/name to match candidate devices.
 static std::string read_sysfs_name(const std::string& devname) {
@@ -51,14 +52,21 @@ static bool set_ctrl(int fd, uint32_t id, int32_t val, const char* label) {
     ctrl.id    = id;
     ctrl.value = val;
     if (ioctl(fd, VIDIOC_S_CTRL, &ctrl) < 0) {
-        std::lock_guard<std::mutex> lk(log_mtx);
+        std::lock_guard<PIMutex> lk(log_mtx);
         *log_out << "[CAPTURE] warning: failed to set " << label << "\n";
         return false;
     }
     return true;
 }
 
+static void prefault_stack() {
+    const size_t SZ = 256 * 1024;
+    volatile char buf[SZ];
+    for (size_t i = 0; i < SZ; i += 4096) buf[i] = 0;
+}
+
 void capture_thread() {
+    prefault_stack();
     const SensorSpec& spec = *g_sensor;
 
     // ---- Device discovery ------------------------------------------------
@@ -71,7 +79,7 @@ void capture_thread() {
     std::string subdev_path = find_subdev(sensor_needle);
 
     if (video_path.empty() || subdev_path.empty()) {
-        std::lock_guard<std::mutex> lk(log_mtx);
+        std::lock_guard<PIMutex> lk(log_mtx);
         *log_out << "[CAPTURE] device discovery failed"
                  << " (video=" << video_path
                  << " subdev=" << subdev_path << ")\n";
@@ -80,7 +88,7 @@ void capture_thread() {
     }
 
     {
-        std::lock_guard<std::mutex> lk(log_mtx);
+        std::lock_guard<PIMutex> lk(log_mtx);
         *log_out << "[CAPTURE] video=" << video_path
                  << " subdev=" << subdev_path << "\n";
     }
@@ -88,7 +96,7 @@ void capture_thread() {
     int subdev_fd = open(subdev_path.c_str(), O_RDWR);
     int video_fd  = open(video_path.c_str(),  O_RDWR);
     if (subdev_fd < 0 || video_fd < 0) {
-        std::lock_guard<std::mutex> lk(log_mtx);
+        std::lock_guard<PIMutex> lk(log_mtx);
         *log_out << "[CAPTURE] failed to open devices\n";
         running = false;
         if (subdev_fd >= 0) close(subdev_fd);
@@ -105,7 +113,7 @@ void capture_thread() {
     sfmt.format.code      = MEDIA_BUS_FMT_Y10_1X10;
     sfmt.format.field     = V4L2_FIELD_NONE;
     if (ioctl(subdev_fd, VIDIOC_SUBDEV_S_FMT, &sfmt) < 0) {
-        std::lock_guard<std::mutex> lk(log_mtx);
+        std::lock_guard<PIMutex> lk(log_mtx);
         *log_out << "[CAPTURE] VIDIOC_SUBDEV_S_FMT failed\n";
         running = false;
         close(subdev_fd); close(video_fd);
@@ -120,7 +128,7 @@ void capture_thread() {
     fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_Y10P;
     fmt.fmt.pix.field       = V4L2_FIELD_NONE;
     if (ioctl(video_fd, VIDIOC_S_FMT, &fmt) < 0) {
-        std::lock_guard<std::mutex> lk(log_mtx);
+        std::lock_guard<PIMutex> lk(log_mtx);
         *log_out << "[CAPTURE] VIDIOC_S_FMT failed\n";
         running = false;
         close(subdev_fd); close(video_fd);
@@ -148,7 +156,7 @@ void capture_thread() {
             double confirmed_fps = (double)spec.pixel_clock_hz
                                    / ((spec.width + spec.hblank_min)
                                       * (spec.height + chk.value));
-            std::lock_guard<std::mutex> lk(log_mtx);
+            std::lock_guard<PIMutex> lk(log_mtx);
             *log_out << "[CAPTURE] vblank readback=" << chk.value
                      << " confirmed_fps=" << confirmed_fps << "\n";
         }
@@ -166,7 +174,7 @@ void capture_thread() {
     set_ctrl(subdev_fd, V4L2_CID_ANALOGUE_GAIN, gain_reg, "ANALOGUE_GAIN");
 
     {
-        std::lock_guard<std::mutex> lk(log_mtx);
+        std::lock_guard<PIMutex> lk(log_mtx);
         *log_out << "[CAPTURE] " << spec.name
                  << " Y10P " << spec.width << "x" << spec.height
                  << " stride=" << stride
@@ -177,13 +185,13 @@ void capture_thread() {
     }
 
     // ---- Buffer allocation -----------------------------------------------
-    const int n_bufs_requested = 4;
+    const int n_bufs_requested = 2;
     struct v4l2_requestbuffers req = {};
     req.count  = n_bufs_requested;
     req.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     req.memory = V4L2_MEMORY_MMAP;
     if (ioctl(video_fd, VIDIOC_REQBUFS, &req) < 0 || req.count == 0) {
-        std::lock_guard<std::mutex> lk(log_mtx);
+        std::lock_guard<PIMutex> lk(log_mtx);
         *log_out << "[CAPTURE] VIDIOC_REQBUFS failed\n";
         running = false;
         close(subdev_fd); close(video_fd);
@@ -203,7 +211,7 @@ void capture_thread() {
             mmap(nullptr, buf.length, PROT_READ | PROT_WRITE,
                  MAP_SHARED, video_fd, buf.m.offset));
         if (mapped[i].ptr == MAP_FAILED) {
-            std::lock_guard<std::mutex> lk(log_mtx);
+            std::lock_guard<PIMutex> lk(log_mtx);
             *log_out << "[CAPTURE] mmap failed for buffer " << i << "\n";
             running = false;
             close(subdev_fd); close(video_fd);
@@ -215,7 +223,7 @@ void capture_thread() {
     // ---- Start streaming -------------------------------------------------
     enum v4l2_buf_type btype = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     if (ioctl(video_fd, VIDIOC_STREAMON, &btype) < 0) {
-        std::lock_guard<std::mutex> lk(log_mtx);
+        std::lock_guard<PIMutex> lk(log_mtx);
         *log_out << "[CAPTURE] VIDIOC_STREAMON failed\n";
         running = false;
         for (auto& m : mapped) munmap(m.ptr, m.len);
@@ -225,8 +233,38 @@ void capture_thread() {
 
     const int pixels = spec.width * spec.height;
 
+    // Pre-allocate 2 Frames with gray buffers sized for this sensor.
+    // Reusing them avoids a per-frame 1 MB heap allocation + zero-init in the hot path.
+    // Pool size 2 is sufficient: frame period (16.67ms) >> detect time (4ms), so
+    // the slot we're about to reuse has always been released by detection.
+    std::shared_ptr<Frame> frame_pool[2];
+    for (int pi = 0; pi < 2; pi++) {
+        frame_pool[pi]         = std::make_shared<Frame>();
+        frame_pool[pi]->width  = spec.width;
+        frame_pool[pi]->height = spec.height;
+        frame_pool[pi]->gray.resize(pixels);
+    }
+    int pool_idx = 0;
+
+    // Global shutter: all pixels expose simultaneously, then rows are clocked out.
+    // ts_hw (CSI-2 interrupt) fires at end of readout, so:
+    //   ts_camera = ts_hw - readout_time - exposure_time/2
+    // giving the center-of-exposure as the E2E latency reference.
+    double line_period_s = (double)(spec.width + spec.hblank_min) / spec.pixel_clock_hz;
+    double readout_s     = spec.height * line_period_s;
+    double exposure_s    = g_exposure_us * 1e-6;
+    double ts_correction = readout_s + exposure_s / 2.0;
+    {
+        std::lock_guard<PIMutex> lk(log_mtx);
+        *log_out << "[CAPTURE] ts_correction=" << ts_correction * 1000.0
+                 << " ms (readout=" << readout_s * 1000.0
+                 << " ms + exposure/2=" << exposure_s / 2.0 * 1000.0 << " ms)\n";
+    }
+
     // Heap staging buffer — avoids byte-by-byte reads from uncached DMA memory.
     std::vector<uint8_t> raw_staging(frame_size + 32);  // +32 for NEON overread safety
+
+    bool ts_source_logged = false;
 
     // ---- Capture loop ----------------------------------------------------
     while (running) {
@@ -241,21 +279,41 @@ void capture_thread() {
 
         double ts_dqbuf = mono_now();
 
+        // Prefer the kernel's hardware timestamp (set at CSI-2 interrupt).
+        // Fall back to monotonic dequeue time if the driver doesn't advertise it.
+        bool hw_ts = (buf.flags & V4L2_BUF_FLAG_TIMESTAMP_MASK)
+                         == V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+        double ts_hw = hw_ts
+                       ? buf.timestamp.tv_sec + buf.timestamp.tv_usec * 1e-6
+                       : ts_dqbuf;
+
+        if (!ts_source_logged) {
+            std::lock_guard<PIMutex> lk(log_mtx);
+            *log_out << "[CAPTURE] ts_camera source: "
+                     << (hw_ts ? "V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC (hardware)"
+                               : "mono_now() fallback (MONOTONIC flag not set)")
+                     << "\n";
+            ts_source_logged = true;
+        }
+
         // Copy from uncached DMA mapping to heap before unpacking.
         std::memcpy(raw_staging.data(), mapped[buf.index].ptr, frame_size);
         ioctl(video_fd, VIDIOC_QBUF, &buf);  // return buffer immediately after copy
 
-        Frame f;
-        f.ts_camera = ts_dqbuf;  // use monotonic dequeue time; hardware ts may be different clock
-        f.width     = spec.width;
-        f.height    = spec.height;
-        f.gray.resize(pixels);
+        // Reuse pool slot — in steady state never spins since detection (4ms)
+        // finishes well before the next frame arrives (16.67ms).
+        while (frame_pool[pool_idx].use_count() > 1)
+            std::this_thread::yield();
 
-        unpack_to_u8(f.gray.data(), raw_staging.data(),
+        auto& fp     = frame_pool[pool_idx];
+        pool_idx    ^= 1;
+
+        fp->ts_camera = ts_hw - ts_correction;
+        unpack_to_u8(fp->gray.data(), raw_staging.data(),
                      spec.width, spec.height, stride, spec.black_level);
 
-        f.ts_captured = mono_now();
-        latest_frame.push(std::move(f));
+        fp->ts_captured = mono_now();
+        latest_frame.push(fp);
         camera_frame_count.fetch_add(1, std::memory_order_relaxed);
     }
 

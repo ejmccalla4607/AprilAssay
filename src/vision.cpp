@@ -1,5 +1,6 @@
 #include "camera.h"
 
+#include <pthread.h>
 #include <iostream>
 #include <fstream>
 #include <thread>
@@ -11,6 +12,8 @@
 #include <ctime>
 #include <cmath>
 #include <csignal>
+#include <sstream>
+#include <sys/mman.h>
 
 extern "C" {
 #include "apriltag/apriltag.h"
@@ -80,7 +83,7 @@ float             g_quad_decimate  = 1.0f;
 LatestFrame           latest_frame;
 std::atomic<bool>     running{true};
 std::atomic<uint64_t> camera_frame_count{0};
-std::mutex            log_mtx;
+PIMutex               log_mtx;
 std::ostream*         log_out = nullptr;
 
 static void handle_signal(int) { running = false; }
@@ -108,7 +111,7 @@ static void init_logging() {
 }
 
 // ==========================
-// Ring buffer for timing samples
+// Ring buffers for async logging
 // ==========================
 struct LogSample {
     double capture_ms;
@@ -120,33 +123,49 @@ struct LogSample {
     int frames_with_detections;
 };
 
-constexpr int LOG_SIZE = 1024;
+struct DetectEvent {
+    int    id;
+    double x, y, theta;
+    float  margin;
+};
 
+template<typename T, int N>
 class RingBuffer {
-    LogSample        buf[LOG_SIZE];
+    T                buf[N];
     std::atomic<int> w{0}, r{0};
 public:
-    void push(const LogSample& s) {
+    void push(const T& s) {
         int idx = w.load(std::memory_order_relaxed);
-        buf[idx % LOG_SIZE] = s;
+        buf[idx % N] = s;
         w.store(idx + 1, std::memory_order_release);
     }
-    bool pop(LogSample& s) {
+    bool pop(T& s) {
         int rr = r.load(std::memory_order_relaxed);
         int ww = w.load(std::memory_order_acquire);
         if (rr == ww) return false;
-        s = buf[rr % LOG_SIZE];
+        s = buf[rr % N];
         r.store(rr + 1, std::memory_order_release);
         return true;
     }
 };
 
-static RingBuffer log_buffer;
+static RingBuffer<LogSample,   1024> log_buffer;
+static RingBuffer<DetectEvent,  256> detect_log_buffer;
+
+// Touch stack pages from the current thread to wire them in after mlockall.
+// mlockall(MCL_FUTURE) locks pages as they're allocated but doesn't touch them;
+// first stack access per page still faults. 256 KB covers typical RT thread usage.
+static void prefault_stack() {
+    const size_t SZ = 256 * 1024;
+    volatile char buf[SZ];
+    for (size_t i = 0; i < SZ; i += 4096) buf[i] = 0;
+}
 
 // ==========================
 // Detection thread
 // ==========================
 void detection_thread() {
+    prefault_stack();
     apriltag_family_t*   tf = tag36h11_create();
     apriltag_detector_t* td = apriltag_detector_create();
 
@@ -172,16 +191,15 @@ void detection_thread() {
         {-(float)TAG_SIZE_M / 2, -(float)TAG_SIZE_M / 2, 0.f},
     };
 
-    Frame f;
+    std::shared_ptr<Frame> fp;
     std::vector<cv::Point2f> img_pts(4);
+    cv::Mat rvec, tvec;
 
     while (running) {
-        if (!latest_frame.get(f)) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            continue;
-        }
+        if (!latest_frame.wait_and_get(fp)) continue;
 
-        f.ts_dequeued = mono_now();
+        fp->ts_dequeued = mono_now();
+        Frame& f = *fp;
 
         image_u8_t img{
             .width  = f.width,
@@ -203,8 +221,8 @@ void detection_thread() {
             img_pts[2] = {(float)det->p[2][0], (float)det->p[2][1]};
             img_pts[3] = {(float)det->p[3][0], (float)det->p[3][1]};
 
-            cv::Mat rvec, tvec;
-            cv::solvePnP(tag_obj_pts, img_pts, cam_mat, dist_coeffs, rvec, tvec);
+            cv::solvePnP(tag_obj_pts, img_pts, cam_mat, dist_coeffs, rvec, tvec,
+                         false, cv::SOLVEPNP_IPPE_SQUARE);
 
             cv::Mat R_mat;
             cv::Rodrigues(rvec, R_mat);
@@ -213,15 +231,7 @@ void detection_thread() {
             double theta = std::atan2(R_mat.at<double>(0, 2), -R_mat.at<double>(2, 2));
 
             // TODO: publish pose over ethernet
-            {
-                std::lock_guard<std::mutex> lock(log_mtx);
-                *log_out << "[DETECT]"
-                         << " id="    << det->id
-                         << " x="     << x
-                         << " y="     << y
-                         << " theta=" << theta
-                         << " margin=" << det->decision_margin << "\n";
-            }
+            detect_log_buffer.push({det->id, x, y, theta, det->decision_margin});
         }
 
         double ts_pose_done = mono_now();
@@ -249,6 +259,11 @@ void logging_thread() {
     LogSample s;
     double   capture_sum = 0, queue_sum = 0, detect_sum = 0,
              pose_sum    = 0, total_sum  = 0;
+    double   capture_min = 1e9, capture_max = 0;
+    double   queue_min   = 1e9, queue_max   = 0;
+    double   detect_min  = 1e9, detect_max  = 0;
+    double   pose_min    = 1e9, pose_max    = 0;
+    double   total_min   = 1e9, total_max   = 0;
     int      detections_sum = 0;
     int      frames_with_detections_sum = 0;
     int      processed_frames_sum = 0;
@@ -265,6 +280,16 @@ void logging_thread() {
             detect_sum  += s.detect_ms;
             pose_sum    += s.pose_ms;
             total_sum   += s.total_ms;
+            capture_min = std::min(capture_min, s.capture_ms);
+            capture_max = std::max(capture_max, s.capture_ms);
+            queue_min   = std::min(queue_min,   s.queue_ms);
+            queue_max   = std::max(queue_max,   s.queue_ms);
+            detect_min  = std::min(detect_min,  s.detect_ms);
+            detect_max  = std::max(detect_max,  s.detect_ms);
+            pose_min    = std::min(pose_min,    s.pose_ms);
+            pose_max    = std::max(pose_max,    s.pose_ms);
+            total_min   = std::min(total_min,   s.total_ms);
+            total_max   = std::max(total_max,   s.total_ms);
             detections_sum += s.detections_count;
             frames_with_detections_sum += s.frames_with_detections;
             ++processed_frames_sum;
@@ -279,25 +304,63 @@ void logging_thread() {
         double detection_rate = processed_frames_sum > 0 ? (double)frames_with_detections_sum / processed_frames_sum : 0.0;
 
         {
-            std::lock_guard<std::mutex> lock(log_mtx);
+            std::lock_guard<PIMutex> lock(log_mtx);
+            DetectEvent de;
+            while (detect_log_buffer.pop(de)) {
+                *log_out << "[DETECT] id=" << de.id
+                         << " x=" << de.x << " y=" << de.y << " theta=" << de.theta
+                         << " margin=" << de.margin << "\n";
+            }
             *log_out << "Cam FPS: " << cam_fps << " | Det FPS: " << det_fps << " | Det Rate: " << detection_rate;
-            if (detections_sum > 0) {
-                double n = detections_sum;
-                *log_out << " | Capture: "   << capture_sum / n << " ms"
-                         << " | Queue: "     << queue_sum   / n << " ms"
-                         << " | Detect: "    << detect_sum  / n << " ms"
-                         << " | Pose: "      << pose_sum    / n << " ms"
-                         << " | Total E2E: " << total_sum   / n << " ms";
+            if (processed_frames_sum > 0) {
+                double n = processed_frames_sum;
+                *log_out << " | Capture: "   << capture_sum / n << " ms [" << capture_min << "-" << capture_max << "]"
+                         << " | Queue: "     << queue_sum   / n << " ms [" << queue_min   << "-" << queue_max   << "]"
+                         << " | Detect: "    << detect_sum  / n << " ms [" << detect_min  << "-" << detect_max  << "]"
+                         << " | Pose: "      << pose_sum    / n << " ms [" << pose_min    << "-" << pose_max    << "]"
+                         << " | Total E2E: " << total_sum   / n << " ms [" << total_min   << "-" << total_max   << "]";
             }
             *log_out << "\n";
             log_out->flush();
         }
 
         capture_sum = queue_sum = detect_sum = pose_sum = total_sum = 0;
+        capture_min = queue_min = detect_min = pose_min = total_min = 1e9;
+        capture_max = queue_max = detect_max = pose_max = total_max = 0;
         detections_sum = 0;
         frames_with_detections_sum = 0;
         processed_frames_sum = 0;
     }
+}
+
+// ==========================
+// Helpers for RT setup
+// ==========================
+static cpu_set_t parse_cpu_list(const std::string& s) {
+    cpu_set_t cs; CPU_ZERO(&cs);
+    std::istringstream ss(s);
+    std::string token;
+    while (std::getline(ss, token, ',')) {
+        auto dash = token.find('-');
+        if (dash == std::string::npos) {
+            CPU_SET(std::stoi(token), &cs);
+        } else {
+            int lo = std::stoi(token.substr(0, dash));
+            int hi = std::stoi(token.substr(dash + 1));
+            for (int k = lo; k <= hi; k++) CPU_SET(k, &cs);
+        }
+    }
+    return cs;
+}
+
+static cpu_set_t read_isolated_cpus() {
+    cpu_set_t cs; CPU_ZERO(&cs);
+    std::ifstream f("/sys/devices/system/cpu/isolated");
+    if (!f) return cs;
+    std::string line;
+    std::getline(f, line);
+    if (!line.empty() && line.back() == '\n') line.pop_back();
+    return parse_cpu_list(line);
 }
 
 // ==========================
@@ -310,7 +373,7 @@ static void print_usage(const char* prog) {
               << "  --exposure      Exposure time in microseconds (default: 333)\n"
               << "  --gain          Analogue gain multiplier      (default: 1.0)\n"
               << "  --fps           Target frame rate             (default: 60)\n"
-              << "  --nthreads      AprilTag detector threads     (default: 2)\n"
+              << "  --nthreads      AprilTag detector threads     (default: 2, matches isolcpus count)\n"
               << "  --quad-decimate AprilTag quad decimation      (default: 1.0)\n"
               << "  --snapshot      Capture one frame, save as PNG, and exit\n";
 }
@@ -366,6 +429,13 @@ int main(int argc, char* argv[]) {
     }
 
     init_logging();
+
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+        std::lock_guard<PIMutex> lk(log_mtx);
+        *log_out << "[MAIN] warning: mlockall failed (run as root)\n";
+    }
+
+
     *log_out << "Camera: "         << g_sensor->name
              << " | Exposure: "   << g_exposure_us << " µs"
              << " | Gain: "       << g_gain << "x"
@@ -378,16 +448,33 @@ int main(int argc, char* argv[]) {
 
     std::thread t1(capture_thread);
 
+    {
+        sched_param sp{};
+        sp.sched_priority = 10;
+        if (pthread_setschedparam(t1.native_handle(), SCHED_FIFO, &sp) != 0) {
+            std::lock_guard<PIMutex> lk(log_mtx);
+            *log_out << "[MAIN] warning: SCHED_FIFO for capture thread failed (needs root or CAP_SYS_NICE)\n";
+        }
+        // Pin capture thread to core 0 — cores 1,2,3 are isolated for the detection workers.
+        // Capture is SCHED_FIFO 10 so it preempts any OS task on core 0 when a frame arrives.
+        cpu_set_t cpus;
+        CPU_ZERO(&cpus);
+        CPU_SET(0, &cpus);
+        if (pthread_setaffinity_np(t1.native_handle(), sizeof(cpus), &cpus) != 0) {
+            std::lock_guard<PIMutex> lk(log_mtx);
+            *log_out << "[MAIN] warning: setaffinity for capture thread failed\n";
+        }
+    }
+
     if (g_snapshot_out) {
         // Skip the first few frames — early deliveries can be black/garbage.
-        Frame f;
+        std::shared_ptr<Frame> fp;
         for (int skip = 0; skip < 5; skip++) {
-            while (running && !latest_frame.get(f))
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            while (running && !latest_frame.wait_and_get(fp));
         }
 
-        if (!f.gray.empty()) {
-            cv::Mat img(f.height, f.width, CV_8UC1, f.gray.data());
+        if (fp && !fp->gray.empty()) {
+            cv::Mat img(fp->height, fp->width, CV_8UC1, fp->gray.data());
             cv::imwrite(g_snapshot_out, img);
             *log_out << "Snapshot saved: " << g_snapshot_out << "\n";
         }
@@ -397,6 +484,26 @@ int main(int argc, char* argv[]) {
     }
 
     std::thread t2(detection_thread);
+
+    {
+        // SCHED_FIFO below capture (10) so capture can always preempt for new frames.
+        // apriltag worker threads inherit both scheduler policy and affinity.
+        sched_param sp{};
+        sp.sched_priority = 5;
+        if (pthread_setschedparam(t2.native_handle(), SCHED_FIFO, &sp) != 0) {
+            std::lock_guard<PIMutex> lk(log_mtx);
+            *log_out << "[MAIN] warning: SCHED_FIFO for detection thread failed\n";
+        }
+        cpu_set_t iso = read_isolated_cpus();
+        CPU_CLR(0, &iso);  // don't share with capture thread's core
+        if (CPU_COUNT(&iso) > 0) {
+            if (pthread_setaffinity_np(t2.native_handle(), sizeof(iso), &iso) != 0) {
+                std::lock_guard<PIMutex> lk(log_mtx);
+                *log_out << "[MAIN] warning: setaffinity for detection thread failed\n";
+            }
+        }
+    }
+
     std::thread t3(logging_thread);
 
     while (running) std::this_thread::sleep_for(std::chrono::milliseconds(100));
