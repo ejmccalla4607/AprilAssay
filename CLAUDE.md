@@ -32,14 +32,18 @@ The characterization targets three test cases (see `docs/` for full detail):
 # First-time setup (installs deps, builds apriltag, configures isolcpus, CPU governor)
 ./setup.sh
 
-# Standard release build (logs to timestamped vision_YYYYMMDD_HHMMSS.log)
+# Build
 cmake -S . -B build && cmake --build build -j$(nproc)
 
-# Debug build (logs to stdout — use this for development)
-cmake -S . -B build -DDEBUG_LOGGING=1 && cmake --build build -j$(nproc)
-
-# Run (must be root for SCHED_FIFO + unicam IRQ boost)
+# Run — debug to stdout, telemetry suppressed
 sudo ./run.sh --camera ov9281 --fps 60 --quad-decimate 2.0
+
+# Run — debug → ./logs/vision_YYYYMMDD_HHMMSS_debug.log
+#         telemetry → ./logs/vision_YYYYMMDD_HHMMSS_telemetry.csv
+sudo ./run.sh --camera ov9281 --fps 60 --quad-decimate 2.0 --log
+
+# Run — explicit base path (no extension)
+sudo ./run.sh --camera ov9281 --fps 60 --quad-decimate 2.0 --log /tmp/run1
 
 # Snapshot mode — capture one frame to PNG and exit
 sudo ./run.sh --camera ov9281 --snapshot frame.png

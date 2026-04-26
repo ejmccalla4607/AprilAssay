@@ -52,17 +52,10 @@ static bool set_ctrl(int fd, uint32_t id, int32_t val, const char* label) {
     ctrl.id    = id;
     ctrl.value = val;
     if (ioctl(fd, VIDIOC_S_CTRL, &ctrl) < 0) {
-        std::lock_guard<PIMutex> lk(log_mtx);
-        *log_out << "[CAPTURE] warning: failed to set " << label << "\n";
+        LogLine("CAPTURE") << "warning: failed to set " << label;
         return false;
     }
     return true;
-}
-
-static void prefault_stack() {
-    const size_t SZ = 256 * 1024;
-    volatile char buf[SZ];
-    for (size_t i = 0; i < SZ; i += 4096) buf[i] = 0;
 }
 
 void capture_thread() {
@@ -79,25 +72,19 @@ void capture_thread() {
     std::string subdev_path = find_subdev(sensor_needle);
 
     if (video_path.empty() || subdev_path.empty()) {
-        std::lock_guard<PIMutex> lk(log_mtx);
-        *log_out << "[CAPTURE] device discovery failed"
-                 << " (video=" << video_path
-                 << " subdev=" << subdev_path << ")\n";
+        LogLine("CAPTURE") << "device discovery failed"
+                           << " (video=" << video_path
+                           << " subdev=" << subdev_path << ")";
         running = false;
         return;
     }
 
-    {
-        std::lock_guard<PIMutex> lk(log_mtx);
-        *log_out << "[CAPTURE] video=" << video_path
-                 << " subdev=" << subdev_path << "\n";
-    }
+    LogLine("CAPTURE") << "video=" << video_path << " subdev=" << subdev_path;
 
     int subdev_fd = open(subdev_path.c_str(), O_RDWR);
     int video_fd  = open(video_path.c_str(),  O_RDWR);
     if (subdev_fd < 0 || video_fd < 0) {
-        std::lock_guard<PIMutex> lk(log_mtx);
-        *log_out << "[CAPTURE] failed to open devices\n";
+        LogLine("CAPTURE") << "failed to open devices";
         running = false;
         if (subdev_fd >= 0) close(subdev_fd);
         if (video_fd  >= 0) close(video_fd);
@@ -113,8 +100,7 @@ void capture_thread() {
     sfmt.format.code      = MEDIA_BUS_FMT_Y10_1X10;
     sfmt.format.field     = V4L2_FIELD_NONE;
     if (ioctl(subdev_fd, VIDIOC_SUBDEV_S_FMT, &sfmt) < 0) {
-        std::lock_guard<PIMutex> lk(log_mtx);
-        *log_out << "[CAPTURE] VIDIOC_SUBDEV_S_FMT failed\n";
+        LogLine("CAPTURE") << "VIDIOC_SUBDEV_S_FMT failed";
         running = false;
         close(subdev_fd); close(video_fd);
         return;
@@ -128,8 +114,7 @@ void capture_thread() {
     fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_Y10P;
     fmt.fmt.pix.field       = V4L2_FIELD_NONE;
     if (ioctl(video_fd, VIDIOC_S_FMT, &fmt) < 0) {
-        std::lock_guard<PIMutex> lk(log_mtx);
-        *log_out << "[CAPTURE] VIDIOC_S_FMT failed\n";
+        LogLine("CAPTURE") << "VIDIOC_S_FMT failed";
         running = false;
         close(subdev_fd); close(video_fd);
         return;
@@ -156,9 +141,8 @@ void capture_thread() {
             double confirmed_fps = (double)spec.pixel_clock_hz
                                    / ((spec.width + spec.hblank_min)
                                       * (spec.height + chk.value));
-            std::lock_guard<PIMutex> lk(log_mtx);
-            *log_out << "[CAPTURE] vblank readback=" << chk.value
-                     << " confirmed_fps=" << confirmed_fps << "\n";
+            LogLine("CAPTURE") << "vblank readback=" << chk.value
+                                << " confirmed_fps=" << confirmed_fps;
         }
     }
 
@@ -173,16 +157,13 @@ void capture_thread() {
         : std::clamp((int)(g_gain * spec.gain_reg_per_unit),        spec.gain_reg_min, spec.gain_reg_max);
     set_ctrl(subdev_fd, V4L2_CID_ANALOGUE_GAIN, gain_reg, "ANALOGUE_GAIN");
 
-    {
-        std::lock_guard<PIMutex> lk(log_mtx);
-        *log_out << "[CAPTURE] " << spec.name
-                 << " Y10P " << spec.width << "x" << spec.height
-                 << " stride=" << stride
-                 << " vblank=" << vblank
-                 << " fps=" << actual_fps
-                 << " exposure=" << exposure_lines << " lines"
-                 << " gain_reg=" << gain_reg << "\n";
-    }
+    LogLine("CAPTURE") << spec.name
+                       << " Y10P " << spec.width << "x" << spec.height
+                       << " stride=" << stride
+                       << " vblank=" << vblank
+                       << " fps=" << actual_fps
+                       << " exposure=" << exposure_lines << " lines"
+                       << " gain_reg=" << gain_reg;
 
     // ---- Buffer allocation -----------------------------------------------
     const int n_bufs_requested = 2;
@@ -191,8 +172,7 @@ void capture_thread() {
     req.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     req.memory = V4L2_MEMORY_MMAP;
     if (ioctl(video_fd, VIDIOC_REQBUFS, &req) < 0 || req.count == 0) {
-        std::lock_guard<PIMutex> lk(log_mtx);
-        *log_out << "[CAPTURE] VIDIOC_REQBUFS failed\n";
+        LogLine("CAPTURE") << "VIDIOC_REQBUFS failed";
         running = false;
         close(subdev_fd); close(video_fd);
         return;
@@ -211,8 +191,7 @@ void capture_thread() {
             mmap(nullptr, buf.length, PROT_READ | PROT_WRITE,
                  MAP_SHARED, video_fd, buf.m.offset));
         if (mapped[i].ptr == MAP_FAILED) {
-            std::lock_guard<PIMutex> lk(log_mtx);
-            *log_out << "[CAPTURE] mmap failed for buffer " << i << "\n";
+            LogLine("CAPTURE") << "mmap failed for buffer " << i;
             running = false;
             close(subdev_fd); close(video_fd);
             return;
@@ -223,8 +202,7 @@ void capture_thread() {
     // ---- Start streaming -------------------------------------------------
     enum v4l2_buf_type btype = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     if (ioctl(video_fd, VIDIOC_STREAMON, &btype) < 0) {
-        std::lock_guard<PIMutex> lk(log_mtx);
-        *log_out << "[CAPTURE] VIDIOC_STREAMON failed\n";
+        LogLine("CAPTURE") << "VIDIOC_STREAMON failed";
         running = false;
         for (auto& m : mapped) munmap(m.ptr, m.len);
         close(subdev_fd); close(video_fd);
@@ -254,12 +232,9 @@ void capture_thread() {
     double readout_s     = spec.height * line_period_s;
     double exposure_s    = g_exposure_us * 1e-6;
     double ts_correction = readout_s + exposure_s / 2.0;
-    {
-        std::lock_guard<PIMutex> lk(log_mtx);
-        *log_out << "[CAPTURE] ts_correction=" << ts_correction * 1000.0
-                 << " ms (readout=" << readout_s * 1000.0
-                 << " ms + exposure/2=" << exposure_s / 2.0 * 1000.0 << " ms)\n";
-    }
+    LogLine("CAPTURE") << "ts_correction=" << ts_correction * 1000.0
+                       << " ms (readout=" << readout_s * 1000.0
+                       << " ms + exposure/2=" << exposure_s / 2.0 * 1000.0 << " ms)";
 
     // Heap staging buffer — avoids byte-by-byte reads from uncached DMA memory.
     std::vector<uint8_t> raw_staging(frame_size + 32);  // +32 for NEON overread safety
@@ -288,11 +263,9 @@ void capture_thread() {
                        : ts_dqbuf;
 
         if (!ts_source_logged) {
-            std::lock_guard<PIMutex> lk(log_mtx);
-            *log_out << "[CAPTURE] ts_camera source: "
-                     << (hw_ts ? "V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC (hardware)"
-                               : "mono_now() fallback (MONOTONIC flag not set)")
-                     << "\n";
+            LogLine("CAPTURE") << "ts_camera source: "
+                               << (hw_ts ? "V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC (hardware)"
+                                         : "mono_now() fallback (MONOTONIC flag not set)");
             ts_source_logged = true;
         }
 

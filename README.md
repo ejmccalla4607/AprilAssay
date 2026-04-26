@@ -2,28 +2,44 @@
 
 <table><tr>
 <td><img src="assets/logo.png" width="400" alt="AprilAssay logo"></td>
-<td valign="top">AprilAssay characterizes camera performance for AprilTag detection in the context of FRC robotics. It runs a live vision pipeline on a Raspberry Pi 4, capturing frames directly via V4L2/unicam, detecting AprilTag 36h11 tags, estimating 6-DOF pose, and logging per-stage latency to measure end-to-end pipeline performance.</td>
+<td valign="top">AprilAssay characterizes camera sensor performance for AprilTag detection in the context of FRC robotics. It runs a live vision pipeline on a Raspberry Pi 4, capturing frames directly via V4L2/unicam, detecting AprilTag 36h11 tags, estimating 6-DOF pose, and producing two log streams: a per-frame telemetry CSV for sensor characterization and a human-readable debug log for pipeline diagnostics.</td>
 </tr></table>
 
-## What it measures
+## What it produces
 
-Each pipeline stage is timed independently and averaged over a 2-second reporting interval:
+### Debug log (`<base>_debug.log` or stdout)
+
+Human-readable pipeline diagnostics. A two-line summary is printed once at program exit (Ctrl-C), accumulating stats over the entire run:
+
+```
+Duration: 60.1 s | Cam frames: 3607 | Det frames: 3601
+Cam FPS: 60.0 | Det FPS: 59.9 | Det Rate: 0.97 | Capture: 20.3 ms [20.1-20.9] | Queue: 0.05 ms [0.03-0.10] | Detect: 3.5 ms [3.4-4.4] | Pose: 0.0 ms [0.0-0.0] | Total E2E: 23.8 ms [23.6-24.9]
+```
+
+Each pipeline stage is timed independently:
 
 | Stage | Description |
 |---|---|
-| Capture | Unpack from DMA staging buffer to 8-bit gray |
-| Queue | Wait time between capture and detection |
+| Capture | DMA copy + NEON unpack from 10-bit packed to 8-bit gray; includes `ts_correction` offset to center-of-exposure |
+| Queue | Wait time between capture complete and detection thread pickup |
 | Detect | AprilTag detection (`apriltag_detector_detect`) |
 | Pose | 6-DOF pose estimation (`cv::solvePnP`) |
-| Total E2E | Dequeue time to pose complete |
+| Total E2E | Center-of-exposure to pose complete |
 
-Latency stats are logged every 2 seconds to a timestamped file (`vision_YYYYMMDD_HHMMSS.log`) or stdout in debug mode. Per-frame detection results are logged immediately:
+### Telemetry CSV (`<base>_telemetry.csv`)
 
-```
-[DETECT] id=5 x=0.123 y=2.341 theta=0.157 margin=0.85
-```
+One row per captured frame. Written only when `--log` is specified. Contains the full per-frame measurement set defined in the characterization plan (Section 9, Tables 6–7):
 
-`x` is lateral offset (meters, camera right), `y` is depth (meters, forward), `theta` is yaw of the tag about the vertical axis (radians, zero when facing the camera directly), `margin` is the decision margin (0–1, higher is more confident).
+**Session inputs** (set at startup via CLI or default 0):
+`timestamp`, `frame_number`, `sensor`, `exposure_us`, `gain_db`, `gain_linear`, `condition_id`, `gantry_x/y/z_level`, `lux_tag`, `light_supply_current_ma`, `shadow_coverage_pct`, `shadow_depth_ratio`
+
+**Per-frame outputs** (computed from the detected tag):
+`detected`, `tag_id`, `decision_margin`, `pixel_count_across_tag`,
+`white_mean/median/std/min/max_dn`, `black_mean/median/std/min/max_dn`,
+`contrast_ratio`, `saturated`, `glare_region_dn`,
+`pose_x_m`, `pose_y_m`, `pose_theta_rad`, `pose_error_mm`
+
+White and black DN statistics come from pixel bands sampled just outside and just inside the tag corner polygon respectively — the same regions the AprilTag detector uses to distinguish foreground from background.
 
 ## Hardware
 
@@ -37,7 +53,7 @@ Both sensors output raw 10-bit CSI-2 packed data (`Y10P`). Frames bypass the ISP
 ## Dependencies
 
 - [AprilTag](https://github.com/AprilRobotics/apriltag)
-- OpenCV 4 (`core`, `calib3d`, `imgcodecs`)
+- OpenCV 4 (`core`, `calib3d`, `imgcodecs`, `imgproc`)
 - CMake ≥ 3.10
 - C++17 compiler
 - Linux kernel V4L2 headers (standard on Raspberry Pi OS)
@@ -50,38 +66,73 @@ Run the setup script once to install dependencies and build from scratch:
 
 ## Building
 
-After initial setup, use the rebuild script for subsequent builds:
+```bash
+./rebuild.sh
+```
+
+Or manually:
 
 ```bash
-# Release build (logs to timestamped file)
-./rebuild.sh
-
-# Debug build (logs to stdout)
-./rebuild.sh DEBUG=1
+cmake -S . -B build && cmake --build build -j$(nproc)
 ```
 
 ## Running
 
+**Always use `run.sh`** — it boosts the unicam IRQ thread to SCHED_FIFO 49 before exec'ing the binary. Running the binary directly causes CSI-2 wakeup jitter.
+
 ```bash
-./build/vision [--camera ov9281|imx296] [--exposure <µs>] [--gain <x>] [--fps <n>] [--snapshot <file>]
+sudo ./run.sh [options]
 ```
+
+### Core options
 
 | Flag | Default | Description |
 |---|---|---|
-| `--camera` | `ov9281` | Sensor model — selects resolution, intrinsics, and timing parameters |
-| `--exposure` | 333 µs | Exposure time in microseconds |
-| `--gain` | 1.0× | Analogue gain multiplier |
-| `--fps` | 60 | Target frame rate; clamped to sensor maximum |
-| `--snapshot` | — | Capture one frame, save as PNG, and exit |
+| `--camera ov9281\|imx296` | `ov9281` | Sensor model |
+| `--exposure <µs>` | 333 | Exposure time in microseconds |
+| `--gain <x>` | 1.0 | Analogue gain multiplier |
+| `--fps <n>` | 60 | Target frame rate; clamped to sensor maximum |
+| `--nthreads <n>` | 3 | AprilTag detector worker threads |
+| `--quad-decimate <f>` | 1.0 | Downscale factor before quad detection; 1.0 = full resolution |
+| `--snapshot <file>` | — | Capture one frame, save as PNG, and exit |
 
-Examples:
+### Logging options
+
+| Flag | Description |
+|---|---|
+| *(omit `--log`)* | Debug to stdout; telemetry suppressed |
+| `--log` | Debug → `logs/vision_YYYYMMDD_HHMMSS_debug.log`; telemetry → `logs/vision_YYYYMMDD_HHMMSS_telemetry.csv` |
+| `--log <base>` | Debug → `<base>_debug.log`; telemetry → `<base>_telemetry.csv` |
+
+The `logs/` directory (or any parent of `<base>`) is created automatically.
+
+### Characterization metadata options
+
+These populate the session-input columns of the telemetry CSV. All default to 0 (unknown/N/A).
+
+| Flag | Description |
+|---|---|
+| `--condition <1\|2\|3>` | Test case ID |
+| `--gantry-x/y/z <1-3>` | Gantry position levels |
+| `--lux <f>` | Lux measured at tag surface |
+| `--supply-ma <f>` | COB LED supply current (mA) |
+| `--shadow-coverage <f>` | Shadow coverage % (Test Case 2) |
+| `--shadow-depth <f>` | Shadow depth ratio (Test Case 2) |
+
+### Examples
+
 ```bash
-./build/vision                                         # OV9281, defaults
-./build/vision --camera imx296                         # IMX296, defaults
-./build/vision --camera ov9281 --exposure 1000         # OV9281, 1 ms exposure
-./build/vision --exposure 500 --gain 2                 # OV9281, 500 µs, 2x gain
-./build/vision --fps 100                               # push toward sensor max (~116 fps)
-./build/vision --snapshot frame.png                    # save a single frame and exit
+# Development — debug to stdout, no telemetry
+sudo ./run.sh --camera ov9281 --fps 60 --quad-decimate 2.0
+sudo ./run.sh --camera imx296 --fps 60 --quad-decimate 2.0
+
+# Single-point characterization run
+sudo ./run.sh --camera ov9281 --fps 60 --exposure 400 --gain 4.0 --log ./logs/tc1_x2y2z1 --condition 1 --gantry-x 2 --gantry-y 2 --gantry-z 1 --lux 500 --supply-ma 1200
+sudo ./run.sh --camera imx296 --fps 60 --exposure 400 --gain 4.0 --log ./logs/tc1_x2y2z1 --condition 1 --gantry-x 2 --gantry-y 2 --gantry-z 1 --lux 500 --supply-ma 1200
+
+# Snapshot
+sudo ./run.sh --camera ov9281 --snapshot frame.png
+sudo ./run.sh --camera imx296 --snapshot frame.png
 ```
 
 Stop with `Ctrl-C`.
@@ -157,13 +208,13 @@ Set in `detection_thread()` in [src/vision.cpp](src/vision.cpp):
 
 ```cpp
 td->quad_decimate = 1.0;
-td->nthreads      = 2;
+td->nthreads      = 3;
 ```
 
 | Parameter | Value | Effect |
 |---|---|---|
 | `quad_decimate` | 1.0 | Downsamples the image by this factor before quad detection. Higher values are faster but reduce detection range and accuracy on small or distant tags. 1.0 disables decimation. |
-| `nthreads` | 2 | Number of threads the detector uses internally. Tune to match available cores without starving the capture thread. |
+| `nthreads` | 3 | Number of threads the detector uses internally. Set to match the 3 isolated cores (1, 2, 3). |
 
 Other detector fields worth studying for characterization:
 

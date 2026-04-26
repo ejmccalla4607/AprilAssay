@@ -106,10 +106,23 @@ extern std::atomic<uint64_t> camera_frame_count;
 extern PIMutex               log_mtx;
 extern std::ostream*         log_out;
 
+struct LogLine {
+    std::lock_guard<PIMutex> guard;
+    LogLine(const char* tag) : guard(log_mtx) { *log_out << '[' << tag << "] "; }
+    ~LogLine() { *log_out << '\n'; }
+    template<class T> LogLine& operator<<(const T& v) { *log_out << v; return *this; }
+};
+
 inline double mono_now() {
     timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+inline void prefault_stack() {
+    const size_t SZ = 256 * 1024;
+    volatile char buf[SZ];
+    for (size_t i = 0; i < SZ; i += 4096) buf[i] = 0;
 }
 
 // ==========================

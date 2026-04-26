@@ -11,6 +11,7 @@
 #include <cstring>
 #include <ctime>
 #include <cmath>
+#include <filesystem>
 #include <csignal>
 #include <sstream>
 #include <sys/mman.h>
@@ -24,6 +25,8 @@ extern "C" {
 #include <opencv2/core.hpp>
 #include <opencv2/calib3d.hpp>
 #include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
+#include <iomanip>
 
 static const double TAG_SIZE_M     = 0.165;
 static const int    LOG_INTERVAL_MS = 2000;
@@ -77,37 +80,74 @@ int               g_exposure_us  = 333;
 float             g_gain         = 1.0f;
 int               g_target_fps   = 60;
 const char*       g_snapshot_out   = nullptr;
+const char*       g_log_path       = nullptr;
 int               g_nthreads       = 3;
 float             g_quad_decimate  = 1.0f;
+
+static int   g_condition_id    = 0;
+static int   g_gantry_x        = 0;
+static int   g_gantry_y        = 0;
+static int   g_gantry_z        = 0;
+static float g_lux_tag         = 0.0f;
+static float g_supply_ma       = 0.0f;
+static float g_shadow_coverage = 0.0f;
+static float g_shadow_depth    = 0.0f;
 
 LatestFrame           latest_frame;
 std::atomic<bool>     running{true};
 std::atomic<uint64_t> camera_frame_count{0};
 PIMutex               log_mtx;
 std::ostream*         log_out = nullptr;
+static std::ostream*  log_tel = nullptr;
 
 static void handle_signal(int) { running = false; }
 
 // ==========================
 // Logging setup
 // ==========================
+static std::ofstream debug_file;
+static std::ofstream tel_file;
+
+static const char* CSV_HEADER =
+    "timestamp,frame_number,sensor,exposure_us,gain_db,gain_linear,"
+    "condition_id,gantry_x_level,gantry_y_level,gantry_z_level,"
+    "lux_tag,light_supply_current_ma,shadow_coverage_pct,shadow_depth_ratio,"
+    "detected,tag_id,decision_margin,pixel_count_across_tag,"
+    "white_mean_dn,white_median_dn,white_std_dn,white_min_dn,white_max_dn,"
+    "black_mean_dn,black_median_dn,black_std_dn,black_min_dn,black_max_dn,"
+    "contrast_ratio,saturated,glare_region_dn,"
+    "pose_x_m,pose_y_m,pose_theta_rad,pose_error_mm\n";
+
 static void init_logging() {
-#ifdef DEBUG_LOGGING
-    log_out = &std::cout;
-#else
-    std::time_t t  = std::time(nullptr);
-    std::tm*    tm = std::localtime(&t);
-    char buf[64];
-    std::strftime(buf, sizeof(buf), "vision_%Y%m%d_%H%M%S.log", tm);
-    static std::ofstream file(buf, std::ios::out | std::ios::app);
-    if (!file.is_open()) {
-        std::cerr << "Failed to open log file: " << buf << ", falling back to stdout\n";
+    if (!g_log_path) {
+        log_out = &std::cout;
+        log_tel = nullptr;
+        return;
+    }
+    std::string base(g_log_path);
+    auto parent = std::filesystem::path(base).parent_path();
+    if (!parent.empty())
+        std::filesystem::create_directories(parent);
+
+    debug_file.open(base + "_debug.log", std::ios::out | std::ios::app);
+    if (!debug_file.is_open()) {
+        std::cerr << "Failed to open debug log: " << base << "_debug.log, falling back to stdout\n";
         log_out = &std::cout;
     } else {
-        std::cout << "Logging to: " << buf << "\n";
-        log_out = &file;
+        log_out = &debug_file;
     }
-#endif
+
+    std::string tel_path = base + "_telemetry.csv";
+    bool is_new = !std::filesystem::exists(tel_path) ||
+                   std::filesystem::file_size(tel_path) == 0;
+    tel_file.open(tel_path, std::ios::out | std::ios::app);
+    if (!tel_file.is_open()) {
+        std::cerr << "Failed to open telemetry log: " << tel_path << "\n";
+        log_tel = nullptr;
+    } else {
+        log_tel = &tel_file;
+        if (is_new) *log_tel << CSV_HEADER;
+    }
 }
 
 // ==========================
@@ -123,10 +163,27 @@ struct LogSample {
     int frames_with_detections;
 };
 
-struct DetectEvent {
-    int    id;
-    double x, y, theta;
-    float  margin;
+struct TelemetryRecord {
+    // Session inputs
+    double   timestamp;
+    uint64_t frame_number;
+    int      exposure_us;
+    float    gain_db, gain_linear;
+    int      condition_id;
+    int      gantry_x, gantry_y, gantry_z;
+    float    lux_tag, supply_ma;
+    float    shadow_coverage_pct, shadow_depth_ratio;
+    // Per-frame outputs
+    bool  detected;
+    int   tag_id;
+    float decision_margin;
+    int   pixel_count_across_tag;
+    float white_mean, white_median, white_std, white_min, white_max;
+    float black_mean, black_median, black_std, black_min, black_max;
+    float contrast_ratio;
+    bool  saturated;
+    float glare_region_dn;
+    float pose_x_m, pose_y_m, pose_theta_rad, pose_error_mm;
 };
 
 template<typename T, int N>
@@ -149,16 +206,82 @@ public:
     }
 };
 
-static RingBuffer<LogSample,   1024> log_buffer;
-static RingBuffer<DetectEvent,  256> detect_log_buffer;
+static RingBuffer<LogSample,       1024> log_buffer;
+static RingBuffer<TelemetryRecord,  256> telemetry_buffer;
 
-// Touch stack pages from the current thread to wire them in after mlockall.
-// mlockall(MCL_FUTURE) locks pages as they're allocated but doesn't touch them;
-// first stack access per page still faults. 256 KB covers typical RT thread usage.
-static void prefault_stack() {
-    const size_t SZ = 256 * 1024;
-    volatile char buf[SZ];
-    for (size_t i = 0; i < SZ; i += 4096) buf[i] = 0;
+// ==========================
+// Patch DN statistics helper
+// ==========================
+struct PatchStats { float mean, median, std_dev, min_val, max_val; };
+
+// Computes pixel statistics for the annular region between two polygons scaled
+// from the tag corner polygon. outer_scale > inner_scale defines a ring;
+// e.g. white patch: outer=1.15/inner=1.00; black patch: outer=1.00/inner=0.85.
+static PatchStats compute_patch_stats(
+    const uint8_t* gray, int img_w, int img_h,
+    const double corners[4][2],
+    float outer_scale, float inner_scale)
+{
+    float cx = 0, cy = 0;
+    for (int i = 0; i < 4; i++) { cx += (float)corners[i][0]; cy += (float)corners[i][1]; }
+    cx /= 4; cy /= 4;
+
+    // Scale corner polygon and track bounding box of outer ring
+    std::vector<cv::Point> outer_pts(4), inner_pts(4);
+    int x0 = img_w, y0 = img_h, x1 = 0, y1 = 0;
+    for (int i = 0; i < 4; i++) {
+        int ox = (int)std::round(cx + outer_scale * ((float)corners[i][0] - cx));
+        int oy = (int)std::round(cy + outer_scale * ((float)corners[i][1] - cy));
+        outer_pts[i] = {ox, oy};
+        x0 = std::min(x0, ox); y0 = std::min(y0, oy);
+        x1 = std::max(x1, ox); y1 = std::max(y1, oy);
+        inner_pts[i] = {
+            (int)std::round(cx + inner_scale * ((float)corners[i][0] - cx)),
+            (int)std::round(cy + inner_scale * ((float)corners[i][1] - cy))
+        };
+    }
+    x0 = std::max(0, x0); y0 = std::max(0, y0);
+    x1 = std::min(img_w - 1, x1); y1 = std::min(img_h - 1, y1);
+    int bw = x1 - x0 + 1, bh = y1 - y0 + 1;
+    if (bw <= 0 || bh <= 0) return {0, 0, 0, 0, 0};
+
+    // Offset polygon points to bounding-box origin for small mask allocation
+    cv::Point offset(x0, y0);
+    for (auto& pt : outer_pts) pt -= offset;
+    for (auto& pt : inner_pts) pt -= offset;
+
+    cv::Mat outer_mask(bh, bw, CV_8UC1, cv::Scalar(0));
+    cv::Mat inner_mask(bh, bw, CV_8UC1, cv::Scalar(0));
+    cv::fillConvexPoly(outer_mask, outer_pts, cv::Scalar(255));
+    cv::fillConvexPoly(inner_mask, inner_pts, cv::Scalar(255));
+
+    std::vector<float> px;
+    px.reserve(512);
+    for (int row = 0; row < bh; row++) {
+        const uint8_t* om = outer_mask.ptr<uint8_t>(row);
+        const uint8_t* im = inner_mask.ptr<uint8_t>(row);
+        const uint8_t* gp = gray + (row + y0) * img_w + x0;
+        for (int col = 0; col < bw; col++) {
+            if (om[col] && !im[col])
+                px.push_back((float)gp[col]);
+        }
+    }
+    if (px.empty()) return {0, 0, 0, 0, 0};
+
+    double sum = 0;
+    float mn = 255, mx = 0;
+    for (float v : px) { sum += v; mn = std::min(mn, v); mx = std::max(mx, v); }
+    float mean = (float)(sum / px.size());
+
+    double var = 0;
+    for (float v : px) { double d = v - mean; var += d * d; }
+    float std_dev = (float)std::sqrt(var / px.size());
+
+    std::vector<float> s = px;
+    std::nth_element(s.begin(), s.begin() + s.size() / 2, s.end());
+    float median = s[s.size() / 2];
+
+    return {mean, median, std_dev, mn, mx};
 }
 
 // ==========================
@@ -208,10 +331,22 @@ void detection_thread() {
             .buf    = f.gray.data()
         };
 
-        zarray_t* detections   = apriltag_detector_detect(td, &img);
+        zarray_t* detections     = apriltag_detector_detect(td, &img);
         double    ts_detect_done = mono_now();
-        int       num          = zarray_size(detections);
+        int       num            = zarray_size(detections);
 
+        // Find the highest-margin detection (primary tag for telemetry)
+        apriltag_detection_t* best = nullptr;
+        for (int i = 0; i < num; i++) {
+            apriltag_detection_t* det;
+            zarray_get(detections, i, &det);
+            if (!best || det->decision_margin > best->decision_margin)
+                best = det;
+        }
+
+        // Pose estimation for all detections
+        double pose_x = 0, pose_y = 0, pose_theta = 0;
+        cv::Mat R_mat;
         for (int i = 0; i < num; i++) {
             apriltag_detection_t* det;
             zarray_get(detections, i, &det);
@@ -223,18 +358,63 @@ void detection_thread() {
 
             cv::solvePnP(tag_obj_pts, img_pts, cam_mat, dist_coeffs, rvec, tvec,
                          false, cv::SOLVEPNP_IPPE_SQUARE);
-
-            cv::Mat R_mat;
             cv::Rodrigues(rvec, R_mat);
-            double x     = tvec.at<double>(0);
-            double y     = tvec.at<double>(2);
-            double theta = std::atan2(R_mat.at<double>(0, 2), -R_mat.at<double>(2, 2));
 
+            if (det == best) {
+                pose_x     = tvec.at<double>(0);
+                pose_y     = tvec.at<double>(2);
+                pose_theta = std::atan2(R_mat.at<double>(0, 2), -R_mat.at<double>(2, 2));
+            }
             // TODO: publish pose over ethernet
-            detect_log_buffer.push({det->id, x, y, theta, det->decision_margin});
         }
 
         double ts_pose_done = mono_now();
+
+        // Build telemetry record — patch stats excluded from latency measurement
+        TelemetryRecord rec{};
+        rec.timestamp    = f.ts_camera;
+        rec.frame_number = camera_frame_count.load(std::memory_order_relaxed);
+        rec.exposure_us  = g_exposure_us;
+        rec.gain_linear  = g_gain;
+        rec.gain_db      = 20.0f * std::log10(std::max(g_gain, 1e-6f));
+        rec.condition_id = g_condition_id;
+        rec.gantry_x     = g_gantry_x;
+        rec.gantry_y     = g_gantry_y;
+        rec.gantry_z     = g_gantry_z;
+        rec.lux_tag      = g_lux_tag;
+        rec.supply_ma    = g_supply_ma;
+        rec.shadow_coverage_pct = g_shadow_coverage;
+        rec.shadow_depth_ratio  = g_shadow_depth;
+
+        if (best) {
+            rec.detected = true;
+            rec.tag_id   = best->id;
+            rec.decision_margin = best->decision_margin;
+
+            float min_x = std::min({(float)best->p[0][0], (float)best->p[3][0]});
+            float max_x = std::max({(float)best->p[1][0], (float)best->p[2][0]});
+            rec.pixel_count_across_tag = (int)(max_x - min_x + 0.5f);
+
+            auto ws = compute_patch_stats(f.gray.data(), f.width, f.height,
+                                          best->p, 1.15f, 1.00f);
+            auto bs = compute_patch_stats(f.gray.data(), f.width, f.height,
+                                          best->p, 1.00f, 0.85f);
+            rec.white_mean = ws.mean; rec.white_median = ws.median;
+            rec.white_std  = ws.std_dev; rec.white_min = ws.min_val; rec.white_max = ws.max_val;
+            rec.black_mean = bs.mean; rec.black_median = bs.median;
+            rec.black_std  = bs.std_dev; rec.black_min = bs.min_val; rec.black_max = bs.max_val;
+            rec.contrast_ratio = (bs.median > 0.0f) ? ws.median / bs.median : 0.0f;
+            rec.saturated = (ws.max_val >= 255.0f);
+
+            rec.pose_x_m       = (float)pose_x;
+            rec.pose_y_m       = (float)pose_y;
+            rec.pose_theta_rad = (float)pose_theta;
+        } else {
+            rec.detected = false;
+            rec.tag_id   = -1;
+        }
+        telemetry_buffer.push(rec);
+
         apriltag_detections_destroy(detections);
 
         log_buffer.push({
@@ -256,7 +436,6 @@ void detection_thread() {
 // Logging thread
 // ==========================
 void logging_thread() {
-    LogSample s;
     double   capture_sum = 0, queue_sum = 0, detect_sum = 0,
              pose_sum    = 0, total_sum  = 0;
     double   capture_min = 1e9, capture_max = 0;
@@ -264,16 +443,15 @@ void logging_thread() {
     double   detect_min  = 1e9, detect_max  = 0;
     double   pose_min    = 1e9, pose_max    = 0;
     double   total_min   = 1e9, total_max   = 0;
-    int      detections_sum = 0;
-    int      frames_with_detections_sum = 0;
-    int      processed_frames_sum = 0;
-    uint64_t last_camera_count = 0;
+    int      frames_with_detections = 0;
+    int      processed_frames = 0;
 
-    const double interval_s = LOG_INTERVAL_MS / 1000.0;
+    double start_time = mono_now();
 
-    while (running) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(LOG_INTERVAL_MS));
-
+    // Drains both ring buffers without printing. Called periodically to prevent
+    // overflow and at shutdown for a final flush before the summary is written.
+    auto drain = [&]() {
+        LogSample s;
         while (log_buffer.pop(s)) {
             capture_sum += s.capture_ms;
             queue_sum   += s.queue_ms;
@@ -290,47 +468,81 @@ void logging_thread() {
             pose_max    = std::max(pose_max,    s.pose_ms);
             total_min   = std::min(total_min,   s.total_ms);
             total_max   = std::max(total_max,   s.total_ms);
-            detections_sum += s.detections_count;
-            frames_with_detections_sum += s.frames_with_detections;
-            ++processed_frames_sum;
+            frames_with_detections += s.frames_with_detections;
+            ++processed_frames;
         }
-
-        uint64_t current_camera_count = camera_frame_count.load(std::memory_order_relaxed);
-        uint64_t cam_frames           = current_camera_count - last_camera_count;
-        last_camera_count             = current_camera_count;
-
-        double cam_fps    = cam_frames   / interval_s;
-        double det_fps    = processed_frames_sum / interval_s;
-        double detection_rate = processed_frames_sum > 0 ? (double)frames_with_detections_sum / processed_frames_sum : 0.0;
-
-        {
-            std::lock_guard<PIMutex> lock(log_mtx);
-            DetectEvent de;
-            while (detect_log_buffer.pop(de)) {
-                *log_out << "[DETECT] id=" << de.id
-                         << " x=" << de.x << " y=" << de.y << " theta=" << de.theta
-                         << " margin=" << de.margin << "\n";
+        if (log_tel) {
+            TelemetryRecord rec;
+            while (telemetry_buffer.pop(rec)) {
+                *log_tel << std::fixed << std::setprecision(6)
+                         << rec.timestamp              << ","
+                         << rec.frame_number           << ","
+                         << g_sensor->name             << ","
+                         << rec.exposure_us            << ","
+                         << rec.gain_db                << ","
+                         << rec.gain_linear            << ","
+                         << rec.condition_id           << ","
+                         << rec.gantry_x               << ","
+                         << rec.gantry_y               << ","
+                         << rec.gantry_z               << ","
+                         << rec.lux_tag                << ","
+                         << rec.supply_ma              << ","
+                         << rec.shadow_coverage_pct    << ","
+                         << rec.shadow_depth_ratio     << ","
+                         << (rec.detected ? 1 : 0)     << ","
+                         << rec.tag_id                 << ","
+                         << rec.decision_margin        << ","
+                         << rec.pixel_count_across_tag << ","
+                         << rec.white_mean             << ","
+                         << rec.white_median           << ","
+                         << rec.white_std              << ","
+                         << rec.white_min              << ","
+                         << rec.white_max              << ","
+                         << rec.black_mean             << ","
+                         << rec.black_median           << ","
+                         << rec.black_std              << ","
+                         << rec.black_min              << ","
+                         << rec.black_max              << ","
+                         << rec.contrast_ratio         << ","
+                         << (rec.saturated ? 1 : 0)    << ","
+                         << rec.glare_region_dn        << ","
+                         << rec.pose_x_m               << ","
+                         << rec.pose_y_m               << ","
+                         << rec.pose_theta_rad         << ","
+                         << rec.pose_error_mm          << '\n';
             }
-            *log_out << "Cam FPS: " << cam_fps << " | Det FPS: " << det_fps << " | Det Rate: " << detection_rate;
-            if (processed_frames_sum > 0) {
-                double n = processed_frames_sum;
-                *log_out << " | Capture: "   << capture_sum / n << " ms [" << capture_min << "-" << capture_max << "]"
-                         << " | Queue: "     << queue_sum   / n << " ms [" << queue_min   << "-" << queue_max   << "]"
-                         << " | Detect: "    << detect_sum  / n << " ms [" << detect_min  << "-" << detect_max  << "]"
-                         << " | Pose: "      << pose_sum    / n << " ms [" << pose_min    << "-" << pose_max    << "]"
-                         << " | Total E2E: " << total_sum   / n << " ms [" << total_min   << "-" << total_max   << "]";
-            }
-            *log_out << "\n";
-            log_out->flush();
+            log_tel->flush();
         }
+    };
 
-        capture_sum = queue_sum = detect_sum = pose_sum = total_sum = 0;
-        capture_min = queue_min = detect_min = pose_min = total_min = 1e9;
-        capture_max = queue_max = detect_max = pose_max = total_max = 0;
-        detections_sum = 0;
-        frames_with_detections_sum = 0;
-        processed_frames_sum = 0;
+    while (running) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(LOG_INTERVAL_MS));
+        drain();
     }
+    drain();  // final flush after running goes false
+
+    double elapsed_s  = mono_now() - start_time;
+    uint64_t cam_frames = camera_frame_count.load(std::memory_order_relaxed);
+    double cam_fps    = elapsed_s > 0 ? cam_frames      / elapsed_s : 0;
+    double det_fps    = elapsed_s > 0 ? processed_frames / elapsed_s : 0;
+    double det_rate   = processed_frames > 0
+                        ? (double)frames_with_detections / processed_frames : 0.0;
+
+    std::lock_guard<PIMutex> lock(log_mtx);
+    *log_out << "Duration: "    << std::fixed << std::setprecision(1) << elapsed_s << " s"
+             << " | Cam frames: " << cam_frames
+             << " | Det frames: " << processed_frames << "\n";
+    *log_out << "Cam FPS: "    << cam_fps << " | Det FPS: " << det_fps << " | Det Rate: " << det_rate;
+    if (processed_frames > 0) {
+        double n = processed_frames;
+        *log_out << " | Capture: "   << capture_sum / n << " ms [" << capture_min << "-" << capture_max << "]"
+                 << " | Queue: "     << queue_sum   / n << " ms [" << queue_min   << "-" << queue_max   << "]"
+                 << " | Detect: "    << detect_sum  / n << " ms [" << detect_min  << "-" << detect_max  << "]"
+                 << " | Pose: "      << pose_sum    / n << " ms [" << pose_min    << "-" << pose_max    << "]"
+                 << " | Total E2E: " << total_sum   / n << " ms [" << total_min   << "-" << total_max   << "]";
+    }
+    *log_out << "\n";
+    log_out->flush();
 }
 
 // ==========================
@@ -368,17 +580,31 @@ static cpu_set_t read_isolated_cpus() {
 // ==========================
 static void print_usage(const char* prog) {
     std::cerr << "Usage: " << prog << " [--camera ov9281|imx296] [--exposure <µs>] [--gain <x>] [--fps <n>]"
-                                      " [--nthreads <n>] [--quad-decimate <f>] [--snapshot <file>]\n"
-              << "  --camera        Sensor model                  (default: ov9281)\n"
-              << "  --exposure      Exposure time in microseconds (default: 333)\n"
-              << "  --gain          Analogue gain multiplier      (default: 1.0)\n"
-              << "  --fps           Target frame rate             (default: 60)\n"
-              << "  --nthreads      AprilTag detector threads     (default: 2, matches isolcpus count)\n"
-              << "  --quad-decimate AprilTag quad decimation      (default: 1.0)\n"
-              << "  --snapshot      Capture one frame, save as PNG, and exit\n";
+                                      " [--nthreads <n>] [--quad-decimate <f>] [--snapshot <file>] [--log [<base>]]\n"
+                                      " [--condition <n>] [--gantry-x <n>] [--gantry-y <n>] [--gantry-z <n>]\n"
+                                      " [--lux <f>] [--supply-ma <f>] [--shadow-coverage <f>] [--shadow-depth <f>]\n"
+              << "  --camera           Sensor model                       (default: ov9281)\n"
+              << "  --exposure         Exposure time in microseconds       (default: 333)\n"
+              << "  --gain             Analogue gain multiplier            (default: 1.0)\n"
+              << "  --fps              Target frame rate                   (default: 60)\n"
+              << "  --nthreads         AprilTag detector threads           (default: 2)\n"
+              << "  --quad-decimate    AprilTag quad decimation            (default: 1.0)\n"
+              << "  --snapshot         Capture one frame, save as PNG, and exit\n"
+              << "  --log [<base>]     Log base path (no extension); omit for logs/vision_YYYYMMDD_HHMMSS\n"
+              << "                     Creates <base>_debug.log and <base>_telemetry.csv\n"
+              << "                     Omitting --log entirely sends debug to stdout; telemetry suppressed\n"
+              << "  --condition <n>    Test case ID 1/2/3              (default: 0=unknown)\n"
+              << "  --gantry-x <n>     Gantry X level 1-3              (default: 0=unknown)\n"
+              << "  --gantry-y <n>     Gantry Y level 1-3              (default: 0=unknown)\n"
+              << "  --gantry-z <n>     Gantry Z level 1-3              (default: 0=unknown)\n"
+              << "  --lux <f>          Lux at tag surface               (default: 0=unknown)\n"
+              << "  --supply-ma <f>    COB supply current in mA         (default: 0=unknown)\n"
+              << "  --shadow-coverage <f>  Shadow coverage pct (TC2)   (default: 0=N/A)\n"
+              << "  --shadow-depth <f>     Shadow depth ratio (TC2)    (default: 0=N/A)\n";
 }
 
 int main(int argc, char* argv[]) {
+    std::string log_path_buf;
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--camera" && i + 1 < argc) {
@@ -422,6 +648,32 @@ int main(int argc, char* argv[]) {
             }
         } else if (arg == "--snapshot" && i + 1 < argc) {
             g_snapshot_out = argv[++i];
+        } else if (arg == "--log") {
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                g_log_path = argv[++i];
+            } else {
+                char tmp[64];
+                std::time_t t = std::time(nullptr);
+                std::strftime(tmp, sizeof(tmp), "logs/vision_%Y%m%d_%H%M%S", std::localtime(&t));
+                log_path_buf = tmp;
+                g_log_path = log_path_buf.c_str();
+            }
+        } else if (arg == "--condition" && i + 1 < argc) {
+            g_condition_id = std::stoi(argv[++i]);
+        } else if (arg == "--gantry-x" && i + 1 < argc) {
+            g_gantry_x = std::stoi(argv[++i]);
+        } else if (arg == "--gantry-y" && i + 1 < argc) {
+            g_gantry_y = std::stoi(argv[++i]);
+        } else if (arg == "--gantry-z" && i + 1 < argc) {
+            g_gantry_z = std::stoi(argv[++i]);
+        } else if (arg == "--lux" && i + 1 < argc) {
+            g_lux_tag = std::stof(argv[++i]);
+        } else if (arg == "--supply-ma" && i + 1 < argc) {
+            g_supply_ma = std::stof(argv[++i]);
+        } else if (arg == "--shadow-coverage" && i + 1 < argc) {
+            g_shadow_coverage = std::stof(argv[++i]);
+        } else if (arg == "--shadow-depth" && i + 1 < argc) {
+            g_shadow_depth = std::stof(argv[++i]);
         } else {
             print_usage(argv[0]);
             return 1;
@@ -430,18 +682,26 @@ int main(int argc, char* argv[]) {
 
     init_logging();
 
-    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
-        std::lock_guard<PIMutex> lk(log_mtx);
-        *log_out << "[MAIN] warning: mlockall failed (run as root)\n";
-    }
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0)
+        LogLine("MAIN") << "warning: mlockall failed (run as root)";
 
+    if (g_log_path)
+        LogLine("MAIN") << "debug log: " << g_log_path << "_debug.log"
+                        << " | telemetry: " << g_log_path << "_telemetry.csv";
 
-    *log_out << "Camera: "         << g_sensor->name
-             << " | Exposure: "   << g_exposure_us << " µs"
-             << " | Gain: "       << g_gain << "x"
-             << " | Target FPS: " << g_target_fps
-             << " | nthreads: "   << g_nthreads
-             << " | quad_decimate: " << g_quad_decimate << "\n";
+    LogLine("MAIN") << "Camera: "           << g_sensor->name
+                    << " | Exposure: "     << g_exposure_us << " µs"
+                    << " | Gain: "         << g_gain << "x"
+                    << " | Target FPS: "   << g_target_fps
+                    << " | nthreads: "     << g_nthreads
+                    << " | quad_decimate: " << g_quad_decimate;
+
+    if (g_condition_id || g_gantry_x || g_gantry_y || g_gantry_z ||
+        g_lux_tag || g_supply_ma || g_shadow_coverage || g_shadow_depth)
+        LogLine("MAIN") << "condition=" << g_condition_id
+                        << " gantry=" << g_gantry_x << "/" << g_gantry_y << "/" << g_gantry_z
+                        << " lux=" << g_lux_tag << " supply_ma=" << g_supply_ma
+                        << " shadow_cov=" << g_shadow_coverage << " shadow_depth=" << g_shadow_depth;
 
     signal(SIGINT,  handle_signal);
     signal(SIGTERM, handle_signal);
@@ -451,19 +711,15 @@ int main(int argc, char* argv[]) {
     {
         sched_param sp{};
         sp.sched_priority = 10;
-        if (pthread_setschedparam(t1.native_handle(), SCHED_FIFO, &sp) != 0) {
-            std::lock_guard<PIMutex> lk(log_mtx);
-            *log_out << "[MAIN] warning: SCHED_FIFO for capture thread failed (needs root or CAP_SYS_NICE)\n";
-        }
+        if (pthread_setschedparam(t1.native_handle(), SCHED_FIFO, &sp) != 0)
+            LogLine("MAIN") << "warning: SCHED_FIFO for capture thread failed (needs root or CAP_SYS_NICE)";
         // Pin capture thread to core 0 — cores 1,2,3 are isolated for the detection workers.
         // Capture is SCHED_FIFO 10 so it preempts any OS task on core 0 when a frame arrives.
         cpu_set_t cpus;
         CPU_ZERO(&cpus);
         CPU_SET(0, &cpus);
-        if (pthread_setaffinity_np(t1.native_handle(), sizeof(cpus), &cpus) != 0) {
-            std::lock_guard<PIMutex> lk(log_mtx);
-            *log_out << "[MAIN] warning: setaffinity for capture thread failed\n";
-        }
+        if (pthread_setaffinity_np(t1.native_handle(), sizeof(cpus), &cpus) != 0)
+            LogLine("MAIN") << "warning: setaffinity for capture thread failed";
     }
 
     if (g_snapshot_out) {
@@ -476,7 +732,7 @@ int main(int argc, char* argv[]) {
         if (fp && !fp->gray.empty()) {
             cv::Mat img(fp->height, fp->width, CV_8UC1, fp->gray.data());
             cv::imwrite(g_snapshot_out, img);
-            *log_out << "Snapshot saved: " << g_snapshot_out << "\n";
+            LogLine("MAIN") << "Snapshot saved: " << g_snapshot_out;
         }
         running = false;
         t1.join();
@@ -490,17 +746,13 @@ int main(int argc, char* argv[]) {
         // apriltag worker threads inherit both scheduler policy and affinity.
         sched_param sp{};
         sp.sched_priority = 5;
-        if (pthread_setschedparam(t2.native_handle(), SCHED_FIFO, &sp) != 0) {
-            std::lock_guard<PIMutex> lk(log_mtx);
-            *log_out << "[MAIN] warning: SCHED_FIFO for detection thread failed\n";
-        }
+        if (pthread_setschedparam(t2.native_handle(), SCHED_FIFO, &sp) != 0)
+            LogLine("MAIN") << "warning: SCHED_FIFO for detection thread failed";
         cpu_set_t iso = read_isolated_cpus();
         CPU_CLR(0, &iso);  // don't share with capture thread's core
         if (CPU_COUNT(&iso) > 0) {
-            if (pthread_setaffinity_np(t2.native_handle(), sizeof(iso), &iso) != 0) {
-                std::lock_guard<PIMutex> lk(log_mtx);
-                *log_out << "[MAIN] warning: setaffinity for detection thread failed\n";
-            }
+            if (pthread_setaffinity_np(t2.native_handle(), sizeof(iso), &iso) != 0)
+                LogLine("MAIN") << "warning: setaffinity for detection thread failed";
         }
     }
 

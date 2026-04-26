@@ -17,11 +17,3 @@ add_executable(vision
 target_link_libraries(vision PRIVATE
     apriltag::apriltag ${OpenCV_LIBS})
 
-# Build with: cmake -DDEBUG_LOGGING=1 ...
-option(DEBUG_LOGGING "Log to stdout instead of file" OFF)
-if(DEBUG_LOGGING)
-    target_compile_definitions(vision PRIVATE DEBUG_LOGGING)
-    message(STATUS "DEBUG_LOGGING: ON (output to stdout)")
-else()
-    message(STATUS "DEBUG_LOGGING: OFF (output to timestamped log file)")
-endif()
