@@ -116,7 +116,8 @@ static const char* CSV_HEADER =
     "white_mean_dn,white_median_dn,white_std_dn,white_min_dn,white_max_dn,"
     "black_mean_dn,black_median_dn,black_std_dn,black_min_dn,black_max_dn,"
     "contrast_ratio,saturated,glare_region_dn,"
-    "pose_x_m,pose_y_m,pose_theta_rad,pose_error_mm\n";
+    "pose_x_m,pose_y_m,pose_theta_rad,pose_error_mm,"
+    "detect_ms\n";
 
 static void init_logging() {
     if (!g_log_path) {
@@ -154,6 +155,7 @@ static void init_logging() {
 // Ring buffers for async logging
 // ==========================
 struct LogSample {
+    double ts_camera;
     double capture_ms;
     double queue_ms;
     double detect_ms;
@@ -184,6 +186,7 @@ struct TelemetryRecord {
     bool  saturated;
     float glare_region_dn;
     float pose_x_m, pose_y_m, pose_theta_rad, pose_error_mm;
+    float detect_ms;
 };
 
 template<typename T, int N>
@@ -413,11 +416,18 @@ void detection_thread() {
             rec.detected = false;
             rec.tag_id   = -1;
         }
+        rec.detect_ms = (float)((ts_detect_done - f.ts_dequeued) * 1000.0);
         telemetry_buffer.push(rec);
 
         apriltag_detections_destroy(detections);
 
+        // Skip first frame — cold-cache penalty on initial apriltag_detector_detect call
+        // inflates detect latency by 8–10x and would skew the run stats.
+        static bool warmed_up = false;
+        if (!warmed_up) { warmed_up = true; continue; }
+
         log_buffer.push({
+            f.ts_camera,
             (f.ts_captured    - f.ts_camera)    * 1000.0,
             (f.ts_dequeued    - f.ts_captured)  * 1000.0,
             (ts_detect_done   - f.ts_dequeued)  * 1000.0,
@@ -438,6 +448,8 @@ void detection_thread() {
 void logging_thread() {
     double   capture_sum = 0, queue_sum = 0, detect_sum = 0,
              pose_sum    = 0, total_sum  = 0;
+    double   capture_sq  = 0, queue_sq  = 0, detect_sq  = 0,
+             pose_sq     = 0, total_sq   = 0;
     double   capture_min = 1e9, capture_max = 0;
     double   queue_min   = 1e9, queue_max   = 0;
     double   detect_min  = 1e9, detect_max  = 0;
@@ -446,18 +458,20 @@ void logging_thread() {
     int      frames_with_detections = 0;
     int      processed_frames = 0;
 
-    double start_time = mono_now();
+    double start_time = 0, end_time = 0;
 
     // Drains both ring buffers without printing. Called periodically to prevent
     // overflow and at shutdown for a final flush before the summary is written.
     auto drain = [&]() {
         LogSample s;
         while (log_buffer.pop(s)) {
-            capture_sum += s.capture_ms;
-            queue_sum   += s.queue_ms;
-            detect_sum  += s.detect_ms;
-            pose_sum    += s.pose_ms;
-            total_sum   += s.total_ms;
+            if (start_time == 0) start_time = s.ts_camera;
+            end_time = s.ts_camera;
+            capture_sum += s.capture_ms;  capture_sq += s.capture_ms * s.capture_ms;
+            queue_sum   += s.queue_ms;    queue_sq   += s.queue_ms   * s.queue_ms;
+            detect_sum  += s.detect_ms;   detect_sq  += s.detect_ms  * s.detect_ms;
+            pose_sum    += s.pose_ms;     pose_sq    += s.pose_ms    * s.pose_ms;
+            total_sum   += s.total_ms;    total_sq   += s.total_ms   * s.total_ms;
             capture_min = std::min(capture_min, s.capture_ms);
             capture_max = std::max(capture_max, s.capture_ms);
             queue_min   = std::min(queue_min,   s.queue_ms);
@@ -509,7 +523,8 @@ void logging_thread() {
                          << rec.pose_x_m               << ","
                          << rec.pose_y_m               << ","
                          << rec.pose_theta_rad         << ","
-                         << rec.pose_error_mm          << '\n';
+                         << rec.pose_error_mm          << ","
+                         << rec.detect_ms              << '\n';
             }
             log_tel->flush();
         }
@@ -521,7 +536,7 @@ void logging_thread() {
     }
     drain();  // final flush after running goes false
 
-    double elapsed_s  = mono_now() - start_time;
+    double elapsed_s  = (start_time > 0 && end_time > start_time) ? end_time - start_time : 0;
     uint64_t cam_frames = camera_frame_count.load(std::memory_order_relaxed);
     double cam_fps    = elapsed_s > 0 ? cam_frames      / elapsed_s : 0;
     double det_fps    = elapsed_s > 0 ? processed_frames / elapsed_s : 0;
@@ -535,11 +550,14 @@ void logging_thread() {
     *log_out << "Cam FPS: "    << cam_fps << " | Det FPS: " << det_fps << " | Det Rate: " << det_rate;
     if (processed_frames > 0) {
         double n = processed_frames;
-        *log_out << " | Capture: "   << capture_sum / n << " ms [" << capture_min << "-" << capture_max << "]"
-                 << " | Queue: "     << queue_sum   / n << " ms [" << queue_min   << "-" << queue_max   << "]"
-                 << " | Detect: "    << detect_sum  / n << " ms [" << detect_min  << "-" << detect_max  << "]"
-                 << " | Pose: "      << pose_sum    / n << " ms [" << pose_min    << "-" << pose_max    << "]"
-                 << " | Total E2E: " << total_sum   / n << " ms [" << total_min   << "-" << total_max   << "]";
+        auto sd = [&](double sum, double sq) {
+            return std::sqrt(std::max(0.0, sq / n - (sum / n) * (sum / n)));
+        };
+        *log_out << " | Capture: "   << capture_sum/n << " ± " << sd(capture_sum, capture_sq) << " ms [" << capture_min << "-" << capture_max << "]"
+                 << " | Queue: "     << queue_sum  /n << " ± " << sd(queue_sum,   queue_sq)   << " ms [" << queue_min   << "-" << queue_max   << "]"
+                 << " | Detect: "    << detect_sum /n << " ± " << sd(detect_sum,  detect_sq)  << " ms [" << detect_min  << "-" << detect_max  << "]"
+                 << " | Pose: "      << pose_sum   /n << " ± " << sd(pose_sum,    pose_sq)    << " ms [" << pose_min    << "-" << pose_max    << "]"
+                 << " | Total E2E: " << total_sum  /n << " ± " << sd(total_sum,   total_sq)   << " ms [" << total_min   << "-" << total_max   << "]";
     }
     *log_out << "\n";
     log_out->flush();
