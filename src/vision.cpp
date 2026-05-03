@@ -752,6 +752,9 @@ int main(int argc, char* argv[]) {
             cv::imwrite(g_snapshot_out, img);
             LogLine("MAIN") << "Snapshot saved: " << g_snapshot_out;
         }
+        fp.reset();  // release frame pool slot before join — capture thread spins on
+                     // use_count > 1 inside its loop and never checks running, so
+                     // t1.join() deadlocks if we still hold the shared_ptr here.
         running = false;
         t1.join();
         return 0;
