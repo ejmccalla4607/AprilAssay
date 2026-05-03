@@ -9,13 +9,14 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 # PipeWire/WirePlumber grab camera devices and hold them open, causing
-# VIDIOC_S_FMT to fail with EBUSY.  Stop them before opening the camera.
+# VIDIOC_S_FMT to fail with EBUSY.  Stop both the system service and the
+# user session service (PipeWire typically runs as the latter on Pi OS).
+REAL_USER=$(logname 2>/dev/null || who | awk 'NR==1{print $1}')
 for svc in pipewire wireplumber pipewire-pulse; do
-    if systemctl is-active --quiet "$svc" 2>/dev/null; then
-        systemctl stop "$svc"
-        echo "[run.sh] stopped $svc"
-    fi
+    systemctl stop "$svc" 2>/dev/null
+    [[ -n "$REAL_USER" ]] && sudo -u "$REAL_USER" systemctl --user stop "$svc" 2>/dev/null
 done
+pkill -x pipewire wireplumber 2>/dev/null; sleep 0.5
 
 # Pi 4 unicam creates a named threaded-IRQ kernel thread; boost it so the
 # CSI-2 frame-end wakeup is immediate (priority 49 > capture thread FIFO 10).

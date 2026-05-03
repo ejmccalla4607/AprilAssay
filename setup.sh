@@ -50,10 +50,10 @@ else
 fi
 
 echo "=== Disabling PipeWire (conflicts with direct V4L2 camera access) ==="
+# PipeWire runs as a user session service on Pi OS — disable both system and user instances.
 for svc in pipewire wireplumber pipewire-pulse; do
-    if systemctl is-enabled "$svc" 2>/dev/null | grep -qv "not-found"; then
-        sudo systemctl disable --now "$svc" 2>/dev/null && echo "Disabled $svc" || true
-    fi
+    sudo systemctl disable --now "$svc" 2>/dev/null || true
+    systemctl --user disable --now "$svc" 2>/dev/null || true
 done
 
 echo "=== Configuring kernel CPU isolation for low-latency detection ==="
