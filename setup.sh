@@ -24,6 +24,18 @@ fi
 cmake $PI_FLAGS -S "$SCRIPT_DIR" -B "$SCRIPT_DIR/build"
 cmake --build "$SCRIPT_DIR/build" -j$(nproc)
  
+echo "=== Installing PREEMPT_RT kernel ==="
+# Use the RPi Foundation's RT kernel (linux-image-rpi-v8-rt), not the Debian
+# upstream (linux-image-rt-arm64) which lacks the rp1-cfe/unicam camera drivers.
+if uname -r | grep -q "\-rt"; then
+    echo "RT kernel already running ($(uname -r)) — skipping"
+elif dpkg -l linux-image-rpi-v8-rt 2>/dev/null | grep -q "^ii"; then
+    echo "RT kernel already installed — skipping (reboot to activate)"
+else
+    sudo apt install -y linux-image-rpi-v8-rt
+    echo "RT kernel installed — reboot required to activate"
+fi
+
 echo "=== Configuring kernel CPU isolation for low-latency detection ==="
 CMDLINE=/boot/firmware/cmdline.txt
 if grep -q "isolcpus=1,2,3" "$CMDLINE"; then
@@ -55,4 +67,7 @@ RCEOF
 fi
 
 echo "=== Setup complete ==="
-echo "Executable is at ~/projects/tbd/build/vision"
+echo "Executable is at $SCRIPT_DIR/build/vision"
+if ! uname -r | grep -q "\-rt"; then
+    echo "*** Reboot required for RT kernel and/or CPU isolation to take effect ***"
+fi
