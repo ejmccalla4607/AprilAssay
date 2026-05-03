@@ -597,12 +597,12 @@ static cpu_set_t read_isolated_cpus() {
 // Main
 // ==========================
 static void print_usage(const char* prog) {
-    std::cerr << "Usage: " << prog << " [--camera ov9281|imx296] [--exposure <µs>] [--gain <x>] [--fps <n>]"
+    std::cerr << "Usage: " << prog << " [--camera ov9281|imx296] [--exposure <ms>] [--gain <x>] [--fps <n>]"
                                       " [--nthreads <n>] [--quad-decimate <f>] [--snapshot <file>] [--log [<base>]]\n"
                                       " [--condition <n>] [--gantry-x <n>] [--gantry-y <n>] [--gantry-z <n>]\n"
                                       " [--lux <f>] [--supply-ma <f>] [--shadow-coverage <f>] [--shadow-depth <f>]\n"
               << "  --camera           Sensor model                       (default: ov9281)\n"
-              << "  --exposure         Exposure time in microseconds       (default: 1500)\n"
+              << "  --exposure         Exposure time in milliseconds        (default: 1.5)\n"
               << "  --gain             Analogue gain multiplier            (default: 1.0)\n"
               << "  --fps              Target frame rate                   (default: 60)\n"
               << "  --nthreads         AprilTag detector threads           (default: 2)\n"
@@ -635,11 +635,12 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
         } else if (arg == "--exposure" && i + 1 < argc) {
-            g_exposure_us = std::stoi(argv[++i]);
-            if (g_exposure_us < 1) {
-                std::cerr << "Error: --exposure must be >= 1 µs\n";
+            float exposure_ms = std::stof(argv[++i]);
+            if (exposure_ms < 0.001f) {
+                std::cerr << "Error: --exposure must be >= 0.001 ms\n";
                 return 1;
             }
+            g_exposure_us = (int)(exposure_ms * 1000.0f);
         } else if (arg == "--gain" && i + 1 < argc) {
             g_gain = std::stof(argv[++i]);
             if (g_gain < 1.0f) {
@@ -708,7 +709,7 @@ int main(int argc, char* argv[]) {
                         << " | telemetry: " << g_log_path << "_telemetry.csv";
 
     LogLine("MAIN") << "Camera: "           << g_sensor->name
-                    << " | Exposure: "     << g_exposure_us << " µs"
+                    << " | Exposure: "     << g_exposure_us / 1000.0 << " ms"
                     << " | Gain: "         << g_gain << "x"
                     << " | Target FPS: "   << g_target_fps
                     << " | nthreads: "     << g_nthreads

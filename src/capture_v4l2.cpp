@@ -227,8 +227,22 @@ void capture_thread() {
     // ---- Sensor controls -------------------------------------------------
     // Compute vblank for the requested fps; clamp to vblank_min so we never
     // ask for a frame rate the sensor can't achieve.
+    // Also pre-compute exposure lines here so we can expand vblank if needed:
+    // when exposure > frame period the sensor silently ignores the exposure
+    // register, producing a black frame.  Set vblank large enough that
+    // exposure always fits within the frame, accepting a lower fps if needed.
     int64_t hts     = spec.width + spec.hblank_min;
-    int     vts     = (int)(spec.pixel_clock_hz / (hts * g_target_fps));
+    double  line_period_us = (double)hts / spec.pixel_clock_hz * 1e6;
+    int     exposure_lines = std::max(1, (int)(g_exposure_us / line_period_us));
+
+    int     vts_fps = (int)(spec.pixel_clock_hz / (hts * g_target_fps));
+    // Sensor requires exposure <= vts - vblank_min (conservative safe margin).
+    // If exposure demands a longer frame, expand vts and warn — fps will drop.
+    int     vts     = std::max(vts_fps, exposure_lines + spec.vblank_min);
+    if (vts > vts_fps)
+        LogLine("CAPTURE") << "warning: exposure " << g_exposure_us / 1000.0
+                           << " ms exceeds " << g_target_fps
+                           << " fps frame period — actual fps will be reduced";
     int     vblank  = std::max(spec.vblank_min, vts - spec.height);
     double  actual_fps = (double)spec.pixel_clock_hz / (hts * (spec.height + vblank));
 
@@ -248,16 +262,27 @@ void capture_thread() {
         }
     }
 
-    // Exposure in sensor lines: µs / line_period_µs
-    double line_period_us = (spec.width + spec.hblank_min)
-                            / (double)spec.pixel_clock_hz * 1e6;
-    int exposure_lines = std::max(1, (int)(g_exposure_us / line_period_us));
     set_ctrl(subdev_fd, V4L2_CID_EXPOSURE, exposure_lines, "EXPOSURE");
+    {
+        struct v4l2_control chk = {};
+        chk.id = V4L2_CID_EXPOSURE;
+        if (ioctl(subdev_fd, VIDIOC_G_CTRL, &chk) == 0)
+            LogLine("CAPTURE") << "exposure readback=" << chk.value
+                               << " lines (" << chk.value * line_period_us / 1000.0 << " ms)"
+                               << (chk.value != exposure_lines ? " *** CLAMPED ***" : "");
+    }
 
     int gain_reg = spec.log_gain
         ? std::clamp((int)std::round(200.0f * std::log10(g_gain)), spec.gain_reg_min, spec.gain_reg_max)
         : std::clamp((int)(g_gain * spec.gain_reg_per_unit),        spec.gain_reg_min, spec.gain_reg_max);
     set_ctrl(subdev_fd, V4L2_CID_ANALOGUE_GAIN, gain_reg, "ANALOGUE_GAIN");
+    {
+        struct v4l2_control chk = {};
+        chk.id = V4L2_CID_ANALOGUE_GAIN;
+        if (ioctl(subdev_fd, VIDIOC_G_CTRL, &chk) == 0)
+            LogLine("CAPTURE") << "gain readback=" << chk.value
+                               << (chk.value != gain_reg ? " *** CLAMPED ***" : "");
+    }
 
     LogLine("CAPTURE") << spec.name
                        << " Y10P " << spec.width << "x" << spec.height
