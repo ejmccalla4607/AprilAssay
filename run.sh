@@ -8,6 +8,15 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+# PipeWire/WirePlumber grab camera devices and hold them open, causing
+# VIDIOC_S_FMT to fail with EBUSY.  Stop them before opening the camera.
+for svc in pipewire wireplumber pipewire-pulse; do
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then
+        systemctl stop "$svc"
+        echo "[run.sh] stopped $svc"
+    fi
+done
+
 # Pi 4 unicam creates a named threaded-IRQ kernel thread; boost it so the
 # CSI-2 frame-end wakeup is immediate (priority 49 > capture thread FIFO 10).
 # Pi 5 rp1-cfe may also create a named IRQ thread once streaming; try both.

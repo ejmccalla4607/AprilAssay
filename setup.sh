@@ -49,6 +49,13 @@ else
     echo "*** Reboot required to activate RT kernel ***"
 fi
 
+echo "=== Disabling PipeWire (conflicts with direct V4L2 camera access) ==="
+for svc in pipewire wireplumber pipewire-pulse; do
+    if systemctl is-enabled "$svc" 2>/dev/null | grep -qv "not-found"; then
+        sudo systemctl disable --now "$svc" 2>/dev/null && echo "Disabled $svc" || true
+    fi
+done
+
 echo "=== Configuring kernel CPU isolation for low-latency detection ==="
 CMDLINE=/boot/firmware/cmdline.txt
 if grep -q "isolcpus=1,2,3" "$CMDLINE"; then
