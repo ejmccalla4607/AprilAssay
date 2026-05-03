@@ -76,7 +76,7 @@ const SensorSpec SENSORS[2] = {
 // Globals (declared extern in camera.h)
 // ==========================
 const SensorSpec* g_sensor      = &SENSORS[0];
-int               g_exposure_us  = 333;
+int               g_exposure_us  = 1500;
 float             g_gain         = 1.0f;
 int               g_target_fps   = 60;
 const char*       g_snapshot_out   = nullptr;
@@ -602,7 +602,7 @@ static void print_usage(const char* prog) {
                                       " [--condition <n>] [--gantry-x <n>] [--gantry-y <n>] [--gantry-z <n>]\n"
                                       " [--lux <f>] [--supply-ma <f>] [--shadow-coverage <f>] [--shadow-depth <f>]\n"
               << "  --camera           Sensor model                       (default: ov9281)\n"
-              << "  --exposure         Exposure time in microseconds       (default: 333)\n"
+              << "  --exposure         Exposure time in microseconds       (default: 1500)\n"
               << "  --gain             Analogue gain multiplier            (default: 1.0)\n"
               << "  --fps              Target frame rate                   (default: 60)\n"
               << "  --nthreads         AprilTag detector threads           (default: 2)\n"
