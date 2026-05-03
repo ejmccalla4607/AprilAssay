@@ -3,11 +3,13 @@
 #include <linux/videodev2.h>
 #include <linux/v4l2-subdev.h>
 #include <linux/media-bus-format.h>
+#include <linux/media.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <unistd.h>
+#include <cerrno>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -47,6 +49,94 @@ static std::string find_subdev(const char* needle) {
     return "";
 }
 
+#ifdef RPI5
+// Returns /dev/mediaX whose MEDIA_IOC_DEVICE_INFO driver field matches `driver`.
+static std::string find_media_dev(const char* driver) {
+    for (int i = 0; i < 16; i++) {
+        std::string path = "/dev/media" + std::to_string(i);
+        int fd = open(path.c_str(), O_RDWR);
+        if (fd < 0) continue;
+        struct media_device_info info = {};
+        bool ok = ioctl(fd, MEDIA_IOC_DEVICE_INFO, &info) == 0
+                  && strncmp(info.driver, driver, sizeof(info.driver)) == 0;
+        close(fd);
+        if (ok) return path;
+    }
+    return "";
+}
+
+// Pi 5 rp1-cfe requires explicit media pipeline configuration before streaming.
+// Enables csi2:pad4 -> rp1-cfe-csi2_ch0:pad0 and sets Y10_1X10 on csi2 pads.
+// Pad 4 is the CSI-2 channel-0 source on the rp1-cfe csi2 bridge (fixed in driver).
+static bool configure_rp1_pipeline(const SensorSpec& spec) {
+    std::string media_path = find_media_dev("rp1-cfe");
+    if (media_path.empty()) {
+        LogLine("CAPTURE") << "rp1-cfe media device not found";
+        return false;
+    }
+    int mfd = open(media_path.c_str(), O_RDWR);
+    if (mfd < 0) {
+        LogLine("CAPTURE") << "open " << media_path << " failed";
+        return false;
+    }
+
+    uint32_t csi2_id = 0, ch0_id = 0;
+    {
+        struct media_entity_desc ent = {};
+        ent.id = MEDIA_ENT_ID_FLAG_NEXT;
+        while (ioctl(mfd, MEDIA_IOC_ENUM_ENTITIES, &ent) == 0) {
+            if (strcmp(ent.name, "csi2")              == 0) csi2_id = ent.id;
+            if (strcmp(ent.name, "rp1-cfe-csi2_ch0") == 0) ch0_id  = ent.id;
+            ent.id |= MEDIA_ENT_ID_FLAG_NEXT;
+        }
+    }
+    if (!csi2_id || !ch0_id) {
+        LogLine("CAPTURE") << "media entities missing (csi2=" << csi2_id
+                           << " ch0=" << ch0_id << ")";
+        close(mfd);
+        return false;
+    }
+
+    struct media_link_desc link = {};
+    link.source.entity = csi2_id; link.source.index = 4; link.source.flags = MEDIA_PAD_FL_SOURCE;
+    link.sink.entity   = ch0_id;  link.sink.index   = 0; link.sink.flags   = MEDIA_PAD_FL_SINK;
+    link.flags = MEDIA_LNK_FL_ENABLED;
+    if (ioctl(mfd, MEDIA_IOC_SETUP_LINK, &link) < 0) {
+        LogLine("CAPTURE") << "MEDIA_IOC_SETUP_LINK failed: " << strerror(errno);
+        close(mfd);
+        return false;
+    }
+    close(mfd);
+
+    std::string csi2_dev = find_subdev("csi2");
+    if (csi2_dev.empty()) {
+        LogLine("CAPTURE") << "csi2 subdev not found";
+        return false;
+    }
+    int csi2_fd = open(csi2_dev.c_str(), O_RDWR);
+    if (csi2_fd < 0) {
+        LogLine("CAPTURE") << "open csi2 subdev failed";
+        return false;
+    }
+    for (int pad : {0, 4}) {
+        struct v4l2_subdev_format sfmt = {};
+        sfmt.which          = V4L2_SUBDEV_FORMAT_ACTIVE;
+        sfmt.pad            = (uint32_t)pad;
+        sfmt.format.width   = spec.width;
+        sfmt.format.height  = spec.height;
+        sfmt.format.code    = MEDIA_BUS_FMT_Y10_1X10;
+        sfmt.format.field   = V4L2_FIELD_NONE;
+        if (ioctl(csi2_fd, VIDIOC_SUBDEV_S_FMT, &sfmt) < 0)
+            LogLine("CAPTURE") << "warning: csi2 pad" << pad << " format failed";
+    }
+    close(csi2_fd);
+
+    LogLine("CAPTURE") << "rp1-cfe pipeline configured (" << media_path
+                       << " csi2=" << csi2_id << " ch0=" << ch0_id << ")";
+    return true;
+}
+#endif
+
 static bool set_ctrl(int fd, uint32_t id, int32_t val, const char* label) {
     struct v4l2_control ctrl = {};
     ctrl.id    = id;
@@ -68,7 +158,11 @@ void capture_thread() {
     std::transform(spec.name, spec.name + strlen(spec.name),
                    sensor_needle, ::tolower);
 
+#ifdef RPI5
+    std::string video_path  = find_video_dev("rp1-cfe-csi2_ch0");
+#else
     std::string video_path  = find_video_dev("unicam-image");
+#endif
     std::string subdev_path = find_subdev(sensor_needle);
 
     if (video_path.empty() || subdev_path.empty()) {
@@ -90,6 +184,14 @@ void capture_thread() {
         if (video_fd  >= 0) close(video_fd);
         return;
     }
+
+#ifdef RPI5
+    if (!configure_rp1_pipeline(spec)) {
+        running = false;
+        close(subdev_fd); close(video_fd);
+        return;
+    }
+#endif
 
     // ---- Sensor subdev format --------------------------------------------
     struct v4l2_subdev_format sfmt = {};

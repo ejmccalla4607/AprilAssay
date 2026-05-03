@@ -1,6 +1,6 @@
 #!/bin/bash
-# Boost the unicam IRQ thread to SCHED_FIFO 49 before running the pipeline.
-# This needs to happen each boot, so run via this script instead of ./build/vision directly.
+# Boost the camera IRQ kernel thread to SCHED_FIFO 49 before running the pipeline.
+# Detects Pi 4 (unicam) or Pi 5 (rp1-cfe) automatically.
 # Usage: sudo ./run.sh [vision args...]
 
 if [[ $EUID -ne 0 ]]; then
@@ -8,15 +8,24 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-# Boost unicam IRQ kernel thread — fires at CSI-2 frame-end, unblocks capture loop.
-# Priority 49 puts it above our capture thread (SCHED_FIFO 10) so the wakeup
-# is immediate rather than waiting for a scheduler tick.
-IRQ_TID=$(grep -r "unicam" /proc/*/comm 2>/dev/null | grep -oP '(?<=/proc/)\d+' | head -1)
+# Pi 4 unicam creates a named threaded-IRQ kernel thread; boost it so the
+# CSI-2 frame-end wakeup is immediate (priority 49 > capture thread FIFO 10).
+# Pi 5 rp1-cfe may also create a named IRQ thread once streaming; try both.
+IRQ_TID=""
+IRQ_NAME=""
+for needle in "unicam" "rp1-cfe"; do
+    IRQ_TID=$(grep -rl "$needle" /proc/*/comm 2>/dev/null | grep -oP '(?<=/proc/)\d+' | head -1)
+    if [[ -n "$IRQ_TID" ]]; then
+        IRQ_NAME="$needle"
+        break
+    fi
+done
+
 if [[ -n "$IRQ_TID" ]]; then
     chrt -f -p 49 "$IRQ_TID"
-    echo "[run.sh] unicam IRQ thread (tid=$IRQ_TID) boosted to SCHED_FIFO 49"
+    echo "[run.sh] $IRQ_NAME IRQ thread (tid=$IRQ_TID) boosted to SCHED_FIFO 49"
 else
-    echo "[run.sh] warning: unicam IRQ thread not found — skipping IRQ boost"
+    echo "[run.sh] warning: camera IRQ thread not found — skipping IRQ boost"
 fi
 
 exec "$(dirname "$0")/build/vision" "$@"

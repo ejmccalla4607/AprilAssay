@@ -15,8 +15,14 @@ sudo cmake --install ~/apriltag/build
 sudo ldconfig
  
 echo "=== Building your vision project ==="
-cmake -S ~/projects/tbd -B ~/projects/tbd/build
-cmake --build ~/projects/tbd/build -j$(nproc)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PI_FLAGS=""
+if grep -q "Raspberry Pi 5" /proc/cpuinfo 2>/dev/null || grep -q "bcm2712" /proc/cpuinfo 2>/dev/null; then
+    PI_FLAGS="-DRPI5=ON"
+    echo "Detected Pi 5 — building with RPI5=ON"
+fi
+cmake $PI_FLAGS -S "$SCRIPT_DIR" -B "$SCRIPT_DIR/build"
+cmake --build "$SCRIPT_DIR/build" -j$(nproc)
  
 echo "=== Configuring kernel CPU isolation for low-latency detection ==="
 CMDLINE=/boot/firmware/cmdline.txt

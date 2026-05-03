@@ -2,7 +2,7 @@
 
 <table><tr>
 <td><img src="assets/logo.png" width="400" alt="AprilAssay logo"></td>
-<td valign="top">AprilAssay characterizes camera sensor performance for AprilTag detection in the context of FRC robotics. It runs a live vision pipeline on a Raspberry Pi 4, capturing frames directly via V4L2/unicam, detecting AprilTag 36h11 tags, estimating 6-DOF pose, and producing two log streams: a per-frame telemetry CSV for sensor characterization and a human-readable debug log for pipeline diagnostics.</td>
+<td valign="top">AprilAssay characterizes camera sensor performance for AprilTag detection in the context of FRC robotics. It runs a live vision pipeline on a Raspberry Pi 4 or 5, capturing frames directly via V4L2, detecting AprilTag 36h11 tags, estimating 6-DOF pose, and producing two log streams: a per-frame telemetry CSV for sensor characterization and a human-readable debug log for pipeline diagnostics.</td>
 </tr></table>
 
 ## What it produces
@@ -43,7 +43,7 @@ White and black DN statistics come from pixel bands sampled just outside and jus
 
 ## Hardware
 
-- Raspberry Pi 4
+- Raspberry Pi 4 (V4L2/unicam) or Raspberry Pi 5 (V4L2/rp1-cfe)
 - One of the following on CSI-2:
   - **OV9281** — global shutter monochrome, 1280×800, 10-bit
   - **IMX296** — global shutter monochrome, 1456×1088, 10-bit
@@ -70,15 +70,19 @@ Run the setup script once to install dependencies and build from scratch:
 ./rebuild.sh
 ```
 
-Or manually:
+`rebuild.sh` auto-detects the target platform. Or manually:
 
 ```bash
+# Pi 4
 cmake -S . -B build && cmake --build build -j$(nproc)
+
+# Pi 5
+cmake -S . -B build -DRPI5=ON && cmake --build build -j$(nproc)
 ```
 
 ## Running
 
-**Always use `run.sh`** — it boosts the unicam IRQ thread to SCHED_FIFO 49 before exec'ing the binary. Running the binary directly causes CSI-2 wakeup jitter.
+**Always use `run.sh`** — it boosts the camera IRQ kernel thread to SCHED_FIFO 49 before exec'ing the binary (auto-detects Pi 4 unicam or Pi 5 rp1-cfe). Running the binary directly causes CSI-2 wakeup jitter.
 
 ```bash
 sudo ./run.sh [options]
