@@ -28,12 +28,25 @@ echo "=== Installing PREEMPT_RT kernel ==="
 # Use the RPi Foundation's RT kernel (linux-image-rpi-v8-rt), not the Debian
 # upstream (linux-image-rt-arm64) which lacks the rp1-cfe/unicam camera drivers.
 if uname -r | grep -q "\-rt"; then
-    echo "RT kernel already running ($(uname -r)) — skipping"
-elif dpkg -l linux-image-rpi-v8-rt 2>/dev/null | grep -q "^ii"; then
-    echo "RT kernel already installed — skipping (reboot to activate)"
+    echo "RT kernel already running ($(uname -r)) — skipping install"
 else
-    sudo apt install -y linux-image-rpi-v8-rt
-    echo "RT kernel installed — reboot required to activate"
+    if ! dpkg -l linux-image-rpi-v8-rt 2>/dev/null | grep -q "^ii"; then
+        sudo apt install -y linux-image-rpi-v8-rt
+        echo "RT kernel installed"
+    else
+        echo "RT kernel package already installed"
+    fi
+    # On Pi 5 the firmware boots kernel_2712.img by default; override to the RT image.
+    if grep -q "Raspberry Pi 5" /proc/cpuinfo 2>/dev/null || grep -q "bcm2712" /proc/cpuinfo 2>/dev/null; then
+        CONFIG=/boot/firmware/config.txt
+        if grep -q "kernel=kernel8_rt.img" "$CONFIG"; then
+            echo "Pi 5 RT kernel boot entry already set — skipping"
+        else
+            sudo sed -i 's/\[cm4\]/[pi5]\nkernel=kernel8_rt.img\n\n[cm4]/' "$CONFIG"
+            echo "Pi 5 config.txt updated to boot kernel8_rt.img"
+        fi
+    fi
+    echo "*** Reboot required to activate RT kernel ***"
 fi
 
 echo "=== Configuring kernel CPU isolation for low-latency detection ==="
