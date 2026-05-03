@@ -9,12 +9,12 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 # PipeWire/WirePlumber grab camera devices and hold them open, causing
-# VIDIOC_S_FMT to fail with EBUSY.  Stop both the system service and the
-# user session service (PipeWire typically runs as the latter on Pi OS).
+# VIDIOC_S_FMT to fail with EBUSY.  Mask (not just stop) the user-session
+# services so systemd does not respawn them between runs.
 REAL_USER=$(logname 2>/dev/null || who | awk 'NR==1{print $1}')
 for svc in pipewire wireplumber pipewire-pulse; do
     systemctl stop "$svc" 2>/dev/null
-    [[ -n "$REAL_USER" ]] && sudo -u "$REAL_USER" systemctl --user stop "$svc" 2>/dev/null
+    [[ -n "$REAL_USER" ]] && sudo -u "$REAL_USER" systemctl --user mask --now "$svc" 2>/dev/null
 done
 pkill -x pipewire wireplumber 2>/dev/null; sleep 0.5
 
