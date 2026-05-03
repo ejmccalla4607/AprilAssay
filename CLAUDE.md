@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 AprilAssay characterizes camera sensor performance for FRC AprilTag detection. It has two interlocking goals:
 
-1. **Latency pipeline** (current code): runs on a Raspberry Pi 4 with an OV9281 or IMX296 global-shutter CSI-2 camera, captures raw 10-bit frames via V4L2/unicam (bypassing the ISP entirely), detects AprilTag 36h11 tags, estimates 6-DOF pose, and logs per-stage latency. The primary goal is minimizing and measuring end-to-end latency from center-of-exposure to pose output.
+1. **Latency pipeline** (current code): runs on a Raspberry Pi 5 with an OV9281 or IMX296 global-shutter CSI-2 camera, captures raw 10-bit frames via V4L2/rp1-cfe (bypassing the ISP entirely), detects AprilTag 36h11 tags, estimates 6-DOF pose, and logs per-stage latency. The primary goal is minimizing and measuring end-to-end latency from center-of-exposure to pose output.
 
 2. **Sensor characterization** (planned, not yet implemented): a systematic sweep that quantifies how detection reliability degrades under the lighting failure modes documented at real FRC competitions — uneven venue spotlights (GCR 2025), sun glare through windows (Gotham 2025), robot-body shadowing (Team 6328 2025), and near-darkness venues (PCH District Championship 2023). The characterization compares OV9281 vs IMX296 across the full (exposure × gain) space under controlled illumination, shadow, and specular glare conditions, producing the first published quantitative data on which sensor holds up better and why. See `docs/AptilTag Sensor Characterization Plan.docx` for the full protocol.
 
@@ -22,7 +22,7 @@ The characterization targets three test cases (see `docs/` for full detail):
 
 **Why IMX296 is expected to win**: 10 dB more dynamic range (~70 dB vs ~60 dB), lower read noise (~2–3e vs ~4–7e), larger full well (~10,000e vs ~6,000–7,000e). At high gain (18–24 dB), read noise is amplified — OV9281's higher noise floor produces 2–3× more noise contamination than IMX296 at the same gain setting, narrowing the detection window faster from both ends.
 
-**Platform note**: the characterization plan was written for Pi 5 + libcamera. The current codebase runs Pi 4 + V4L2/unicam with Y10P packed format. The characterization sweep software has not been written yet. When implementing it, use the existing V4L2 capture backend — do not add a libcamera dependency. The raw pipeline differences (Pi 5 PiSP 16-bit left-shifted vs Pi 4 Y10P packed) are already handled by the existing `unpack_to_u8` NEON path in `camera.h`.
+**Platform note**: the codebase runs Pi 5 + V4L2/rp1-cfe with Y10P packed format. Do not add a libcamera dependency. Build with `-DRPI5=ON` (handled automatically by `setup.sh` and `rebuild.sh` on Pi 5 hardware).
 
 **Key metric for FRC teams**: detection window width (range of exposures with >95% detection rate) at each gain level. A wider window means the sensor tolerates more venue-to-venue illumination variation without retuning. The characterization also validates a field workflow: measure lux at each tag with a $30 meter during calibration hour, look up the matching pre-characterized exposure/gain profile, load it — no subjective trial-and-error.
 
@@ -32,24 +32,26 @@ The characterization targets three test cases (see `docs/` for full detail):
 # First-time setup (installs deps, builds apriltag, configures isolcpus, CPU governor)
 ./setup.sh
 
-# Build
-cmake -S . -B build && cmake --build build -j$(nproc)
+# Build (Pi 5 — RPI5 flag set automatically by setup.sh/rebuild.sh)
+cmake -DRPI5=ON -S . -B build && cmake --build build -j$(nproc)
 
 # Run — debug to stdout, telemetry suppressed
-sudo ./run.sh --camera ov9281 --fps 60 --quad-decimate 2.0
+sudo ./run.sh --camera imx296 --exposure 10 --gain 4 --fps 60 --quad-decimate 1.0
 
-# Run — debug → ./logs/vision_YYYYMMDD_HHMMSS_debug.log
-#         telemetry → ./logs/vision_YYYYMMDD_HHMMSS_telemetry.csv
-sudo ./run.sh --camera ov9281 --fps 60 --quad-decimate 2.0 --log
-
-# Run — explicit base path (no extension)
-sudo ./run.sh --camera ov9281 --fps 60 --quad-decimate 2.0 --log /tmp/run1
+# Run with logging
+sudo ./run.sh --camera imx296 --exposure 10 --gain 4 --fps 60 --quad-decimate 1.0 --log
 
 # Snapshot mode — capture one frame to PNG and exit
-sudo ./run.sh --camera ov9281 --snapshot frame.png
+sudo ./run.sh --camera imx296 --exposure 10 --gain 4 --snapshot frame.png
+
+# Gain×exposure sweep (TC1 inner loop)
+sudo ./sweep.sh imx296 5
+python3 scripts/sweep_summary.py logs/sweep_YYYYMMDD_HHMMSS_telemetry.csv
 ```
 
-**Always use `run.sh` instead of `./build/vision` directly.** `run.sh` boosts the unicam kernel IRQ thread to SCHED_FIFO 49 before exec'ing the binary. Without this, the CSI-2 interrupt that wakes the capture thread runs at normal priority and adds wake-up jitter.
+**`--exposure` takes milliseconds** (e.g. `--exposure 1.5` = 1500 µs). Internally stored as `g_exposure_us` (µs).
+
+**Always use `run.sh` instead of `./build/vision` directly.** `run.sh` boosts the rp1-cfe kernel IRQ thread to SCHED_FIFO 49 before exec'ing the binary. Without this, the CSI-2 interrupt that wakes the capture thread runs at normal priority and adds wake-up jitter.
 
 ## Architecture
 
